@@ -1,0 +1,810 @@
+
+(() => {
+'use strict';
+const IMGDIR = '../img/';
+const $ = (s, r = document) => r.querySelector(s);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const brl = n => Number(n || 0).toLocaleString('pt-BR', {style:'currency', currency:'BRL'});
+const num = v => { if (typeof v === 'number') return isFinite(v) ? v : 0; let t = String(v == null ? '' : v).replace(/[^\d.,-]/g, ''); if (t.includes(',')) t = t.replace(/\./g, '').replace(',', '.'); const x = parseFloat(t); return isNaN(x) ? 0 : x; };
+const r2 = x => Math.round(x * 100) / 100;
+const fld = n => r2(n).toFixed(2).replace('.', ',');
+const pad = n => String(n).padStart(2, '0');
+const iso = d => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+const today = () => iso(new Date());
+const addDays = (s, n) => { const d = new Date(s + 'T12:00:00'); d.setDate(d.getDate() + n); return iso(d); };
+const diff = (a, b) => Math.round((new Date(a + 'T12:00:00') - new Date(b + 'T12:00:00')) / 864e5);
+const fd = s => s ? s.slice(8, 10) + '/' + s.slice(5, 7) + '/' + s.slice(2, 4) : '';
+const fds = s => s ? s.slice(8, 10) + '/' + s.slice(5, 7) : '';
+const uid = p => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+
+let db = null;
+const S = {products: [], sales: [], wallet: [], catalog: [], loaded: {}, tab: 'resumo', filter: 'todas', q: '', cq: '', brand: '', open: {}, err: '', dp: '6m', dm: '', rm: 'rev', fb: '', fp: '', fv: '', preview: false};
+const SNAP = {items: [], date: ''};
+let F = null;
+let SAMPLE = null, photoBusy = false;
+const ERRPH = {not_granted: 'Você não autorizou o uso do Claude.', rate_limited: 'Muitas tentativas. Aguarde um pouco.', image_rejected: 'Não consegui ler essa imagem. Tente outra foto.', invalid_json: 'Não consegui interpretar a foto. Tente de novo.', upstream_error: 'Erro ao analisar. Tente de novo.'};
+function shrink(file) { return new Promise((res, rej) => { const u = URL.createObjectURL(file), im = new Image();
+  im.onload = () => { const m = 1600, k = Math.min(1, m / Math.max(im.width, im.height)), c = document.createElement('canvas'); c.width = Math.round(im.width * k); c.height = Math.round(im.height * k); c.getContext('2d').drawImage(im, 0, 0, c.width, c.height); URL.revokeObjectURL(u); c.toBlob(b => b ? res(b) : rej(new Error('blob')), 'image/jpeg', 0.85); };
+  im.onerror = () => { URL.revokeObjectURL(u); rej(new Error('img')); }; im.src = u; }); }
+async function photoToSale(file) {
+  const blob = await shrink(file);
+  const cat = S.products.map(p => ({id: p.id, nome: p.name, marca: p.brand || '', preco: p.price, estoque: p.stock || 0}));
+  const prompt = 'Esta foto mostra produtos de cosméticos vendidos a um cliente. Identifique cada produto visível e a quantidade de cada um. ' +
+    'Use SOMENTE produtos deste catálogo (campo id): ' + JSON.stringify(cat) + '\n' +
+    'Se houver um nome de cliente escrito na foto, informe. Se não tiver certeza de um item, inclua mesmo assim com "certeza": false. ' +
+    'Itens que não estão no catálogo vão em "desconhecidos" (descrição curta). ' +
+    'Responda APENAS JSON: {"cliente": string|null, "itens": [{"id": string, "qtd": number, "certeza": boolean}], "desconhecidos": [string]}';
+  const r = await SAMPLE.json(prompt, {images: [blob], cache: false});
+  const url = URL.createObjectURL(blob);
+  const seen = {}, lines = [];
+  (r.itens || []).forEach(it => { const p = S.products.find(x => x.id === String(it.id)); if (!p) return; const q = Math.max(1, Math.round(+it.qtd || 1));
+    if (seen[p.id] != null) { lines[seen[p.id]].qty += q; return; } seen[p.id] = lines.length;
+    lines.push({pid: p.id, qty: q, price: fld(p.price), check: it.certeza === false || q > (p.stock || 0)}); });
+  return {customer: r.cliente || '', lines, unknown: (r.desconhecidos || []).filter(Boolean), url};
+}
+
+/* ---------- derived numbers ---------- */
+const initOf = p => p.initial != null ? p.initial : (p.stock || 0);
+const late = s => !s.paid && s.dueDate && s.dueDate < today();
+const val = s => (s.paid && s.received != null) ? s.received : s.total;
+function status(s) {
+  if (s.paid) return {k: 'ok', t: 'Pago' + (s.paidDate ? ' em ' + fds(s.paidDate) : '')};
+  if (s.dueDate) {
+    const d = diff(today(), s.dueDate);
+    if (d > 0) return {k: 'bad', t: 'Atrasado ' + d + (d > 1 ? ' dias' : ' dia')};
+    if (d === 0) return {k: 'warn', t: 'Vence hoje'};
+    return {k: 'warn', t: 'Vence ' + fds(s.dueDate)};
+  }
+  return {k: 'warn', t: 'A receber'};
+}
+function calc() {
+  const c = {lotCost: 0, lotRev: 0, stCost: 0, stRev: 0, units: 0, stUnits: 0, sold: 0, paid: 0, pend: 0, late: 0, soldCost: 0, inn: 0, out: 0, aporte: 0};
+  S.products.forEach(p => { const i = initOf(p), st = p.stock || 0; c.lotCost += p.cost * i; c.lotRev += p.price * i; c.stCost += p.cost * st; c.stRev += p.price * st; c.units += i; c.stUnits += st; });
+  S.sales.forEach(s => { c.sold += val(s); c.soldCost += s.costTotal; if (s.paid) c.paid += val(s); else { c.pend += s.total; if (late(s)) c.late += s.total; } });
+  S.wallet.forEach(w => { if (w.type === 'entrada') c.aporte += w.amount; else c.out += w.amount; });
+  c.profit = c.sold - c.soldCost;
+  c.balance = c.paid + c.aporte - c.out;
+  return c;
+}
+const prodSort = (a, b) => (a.n || 0) - (b.n || 0) || (a.name || '').localeCompare(b.name || '');
+
+/* ---------- small view helpers ---------- */
+const tile = (l, v, n, cls = '') => `<div class="tile ${cls}"><div class="l">${l}</div><div class="v">${v}</div><div class="n">${n || ''}</div></div>`;
+const empty = t => `<div class="empty">${t}</div>`;
+function pimg(p) { const im = String(p.img || ''), src = /^https?:/.test(im) ? im : (im ? IMGDIR + im + '.jpg' : ''); return src ? `<img src="${src}" alt="">` : esc((p.name || '?').trim().charAt(0).toUpperCase()); }
+function stockPill(p) { const s = p.stock || 0; return s <= 0 ? '<span class="pill bad">Esgotado</span>' : `<span class="pill ${s <= 1 ? 'warn' : ''}">${s} em estoque</span>`; }
+
+function saleCard(s, o = {}) {
+  const st = status(s);
+  const items = (s.items || []).map(i => `<div class="ln${o.hl && i.pid === o.hl ? ' hl' : ''}"><span>${i.qty}× ${esc(i.name)}</span><i class="lead"></i><b>${brl(i.qty * i.price)}</b></div>`).join('');
+  return `<article class="sale ${st.k}">
+    <div class="sale-h"><div><div class="who">${o.hideName ? fd(s.date) : esc(s.customer)}</div><div class="muted">${o.hideName ? '' : fd(s.date)}${s.note ? (o.hideName ? '' : ' · ') + esc(s.note) : ''}</div></div><span class="pill ${st.k}">${st.t}</span></div>
+    ${items}
+    <div class="sale-f"><div><div class="tot">${brl(val(s))}</div><div class="muted">lucro ${brl(val(s) - s.costTotal)}${s.paid && s.received != null && r2(s.received) !== r2(s.total) ? ' · cobrado ' + brl(s.total) : ''}</div></div>
+    <div class="acts">${s.paid ? `<button class="btn ghost sm" data-act="unpay" data-id="${s.id}">Desfazer pagamento</button>` : `<button class="btn sm" data-act="pay" data-id="${s.id}">Marcar como pago</button>`}<button class="btn ghost sm" data-act="edit-sale" data-id="${s.id}">Editar</button></div></div>
+  </article>`;
+}
+
+/* ---------- views ---------- */
+function vResumo() {
+  const c = calc();
+  const tot = (c.paid + c.pend + c.stRev) || 1;
+  const seg = (v, k) => v > 0 ? `<i class="${k}" style="flex:${v}"></i>` : '';
+  const due = S.sales.filter(s => !s.paid).sort((a, b) => (a.dueDate || '9999').localeCompare(b.dueDate || '9999')).slice(0, 6);
+  return `
+  <section><h2>O lote inteiro</h2><p class="sub">${c.units} unidades compradas, vendidas pelo preço do catálogo.</p>
+    <div class="tiles">${tile('Custo total', brl(c.lotCost), 'o que você pagou')}${tile('Receita possível', brl(c.lotRev), 'se vender tudo')}${tile('Lucro possível', brl(c.lotRev - c.lotCost), c.lotCost ? Math.round((c.lotRev - c.lotCost) / c.lotCost * 100) + '% sobre o custo' : '', 'hot')}</div></section>
+  <section><h2>Como está hoje</h2><p class="sub">Vendas lançadas até agora e o que ainda está no estoque.</p>
+    <div class="tiles">${tile('Vendido', brl(c.sold), 'lucro ' + brl(c.profit))}${tile('Já recebido', brl(c.paid), '', 'ok')}${tile('A receber', brl(c.pend), c.late ? brl(c.late) + ' em atraso' : 'nada em atraso', c.late ? 'bad' : '')}${tile('No estoque', brl(c.stRev), c.stUnits + ' un · custo ' + brl(c.stCost))}</div>
+    <div class="bar" role="img" aria-label="Divisão da receita entre recebido, a receber e estoque">${seg(c.paid, 'a')}${seg(c.pend, 'b')}${seg(c.stRev, 'c')}</div>
+    <div class="legend"><span><s style="background:var(--ok)"></s>Recebido <b>${brl(c.paid)}</b></span><span><s style="background:var(--warn)"></s>A receber <b>${brl(c.pend)}</b></span><span><s style="background:var(--accent)"></s>No estoque <b>${brl(c.stRev)}</b></span></div></section>
+  <section><h2>Próximos recebimentos</h2><p class="sub">Vendas ainda não pagas, da mais urgente para a mais distante.</p>
+    ${due.length ? `<div class="card">${due.map(s => { const st = status(s); return `<div class="due"><span>${esc(s.customer)} <span class="pill ${st.k}">${st.t}</span></span><i class="lead"></i><b>${brl(s.total)}</b></div>`; }).join('')}</div>` : empty('Nenhum valor pendente. Quando vender fiado, os vencimentos aparecem aqui.')}</section>`;
+}
+
+function vCatalogo() {
+  const q = S.q.trim().toLowerCase();
+  const list = S.products.slice().sort(prodSort).filter(p => !q || (p.name + ' ' + (p.brand || '')).toLowerCase().includes(q));
+  const body = !S.loaded.products ? empty('Carregando catálogo…') : !S.products.length ? empty('Nenhum produto ainda. Toque em “Novo produto” para começar.') : !list.length ? empty('Nenhum produto com esse nome.') :
+    `<div class="cat">${list.map(p => `<button class="prod" data-act="edit-prod" data-id="${p.id}"><div class="im">${pimg(p)}</div><div class="bd"><div class="nm">${esc(p.name)}</div><div class="muted">${esc(p.brand || '')}</div>
+      <div class="pr"><span>Custo</span><b>${brl(p.cost)}</b></div><div class="pr"><span>Venda</span><b>${brl(p.price)}</b></div><div class="pr"><span>Lucro</span><b>${brl(p.price - p.cost)}</b></div><div class="row" style="justify-content:space-between">${stockPill(p)}<span class="pill" style="background:var(--accent-soft);color:var(--accent)">✎ Editar</span></div></div></button>`).join('')}</div>`;
+  return `${shareCard()}<section><div class="tools"><input id="q" type="search" placeholder="Buscar produto" value="${esc(S.q)}" aria-label="Buscar produto"><button class="btn" data-act="new-prod">Novo produto</button></div>${body}</section>`;
+}
+
+function vendasProd() {
+  const p = S.products.find(x => x.id === S.fv); if (!p) return '';
+  let sold = 0, rev = 0; S.sales.forEach(s => (s.items || []).forEach(i => { if (i.pid === p.id) { sold += i.qty; rev += i.qty * i.price; } }));
+  const ini = initOf(p), adj = p.adj || 0, exp = ini - sold + adj, st = p.stock || 0, d = st - exp;
+  return `<div class="card" style="margin-bottom:12px"><div class="row sb"><b>${esc(p.name)}</b>${stockPill(p)}</div>
+    <div class="ln"><span>Comprado</span><i class="lead"></i><b>${ini} un</b></div>
+    <div class="ln"><span>Vendido</span><i class="lead"></i><b>${sold} un · ${brl(rev)}</b></div>
+    ${adj ? `<div class="ln"><span>Ajustes de conferência</span><i class="lead"></i><b>${adj > 0 ? '+' : '−'}${Math.abs(adj)} un</b></div>` : ''}
+    <div class="ln"><span>Deveria ter em estoque</span><i class="lead"></i><b>${exp} un</b></div>
+    <div class="ln"><span>Estoque no sistema</span><i class="lead"></i><b>${st} un</b></div>
+    ${d !== 0 ? `<div class="warn-t" style="margin-top:6px">O estoque está ${Math.abs(d)} un ${d > 0 ? 'acima' : 'abaixo'} de compras menos vendas. Confira na prateleira.</div>` : `<div class="muted" style="margin-top:6px">Compras menos vendas bate com o estoque.${p.lastCheck ? ' Última conferência em ' + fd(p.lastCheck) + '.' : ''}</div>`}
+    <div class="row" style="margin-top:10px"><button class="btn ghost sm" data-act="edit-prod" data-id="${p.id}">Editar produto</button></div></div>`;
+}
+function vVendas() {
+  const f = S.filter, hasP = s => !S.fv || (s.items || []).some(i => i.pid === S.fv), base = S.sales.filter(hasP);
+  const cnt = {todas: base.length, receber: base.filter(s => !s.paid).length, atrasadas: base.filter(late).length, pagas: base.filter(s => s.paid).length};
+  const pass = s => f === 'todas' || (f === 'receber' && !s.paid) || (f === 'atrasadas' && late(s)) || (f === 'pagas' && s.paid);
+  const list = base.filter(pass).sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.id.localeCompare(a.id));
+  const chip = (k, t) => `<button class="chip" data-act="filter" data-id="${k}" aria-pressed="${f === k}">${t} (${cnt[k]})</button>`;
+  const prods = S.products.slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  return `<section><div class="tools"><label class="f" style="flex:1;min-width:190px">Produto<select id="fv"><option value="">Todos os produtos</option>${prods.map(p => `<option value="${p.id}" ${p.id === S.fv ? 'selected' : ''}>${esc(p.name)} · ${p.stock || 0} un</option>`).join('')}</select></label><button class="btn ghost" data-act="open-stock" style="align-self:flex-end">Conferir estoque</button></div>
+    ${vendasProd()}<div class="chips">${chip('todas', 'Todas')}${chip('receber', 'A receber')}${chip('atrasadas', 'Atrasadas')}${chip('pagas', 'Pagas')}</div>
+    ${!S.loaded.sales ? empty('Carregando vendas…') : list.length ? `<div class="list">${list.map(s => saleCard(s, {hl: S.fv})).join('')}</div>` : empty(S.sales.length ? (S.fv ? 'Nenhuma venda desse produto nesse filtro.' : 'Nenhuma venda nesse filtro.') : 'Nenhuma venda lançada. Toque em “Nova venda” para registrar a primeira.')}</section>`;
+}
+
+/* ---------- conferência de estoque ---------- */
+function stockRows() { return S.products.slice().sort(prodSort); }
+function stRes(p) {
+  const raw = F.counts[p.id]; if (raw === '' || raw == null) return {k: '', t: ''};
+  const c = Math.max(0, Math.floor(num(raw))), d = c - (p.stock || 0);
+  return d === 0 ? {k: 'ok', t: 'Confere'} : d < 0 ? {k: 'bad', t: 'Faltam ' + (-d)} : {k: 'warn', t: 'Sobram ' + d};
+}
+function updStock() {
+  let n = 0, dif = 0;
+  stockRows().forEach(p => { const r = stRes(p), el = $('#st-' + p.id); if (el) el.innerHTML = r.t ? `<span class="pill ${r.k}">${r.t}</span>` : ''; if (r.t) { n++; if (r.k !== 'ok') dif++; } });
+  const s = $('#ssum'), b = $('#sbtn');
+  if (s) s.textContent = n ? `${n} conferidos · ${dif} com diferença` : 'Digite a quantidade que você contou.';
+  if (b) { b.disabled = !n; b.textContent = dif ? `Salvar e ajustar ${dif} ${dif > 1 ? 'produtos' : 'produto'}` : 'Salvar conferência'; }
+}
+function openStock() {
+  F = {kind: 'stock', counts: {}};
+  openSheet(`${head('Conferir estoque')}<p class="muted" style="margin:0 0 6px">Conte o que tem em mãos e digite ao lado. Toque em ✓ quando a contagem bater com o sistema. Produto em branco fica como está.</p>
+    <div class="row" style="margin-bottom:4px"><button class="btn ghost sm" data-act="stock-fill">Preencher tudo com o sistema</button><button class="btn ghost sm" data-act="stock-clear">Limpar</button></div>
+    ${stockRows().map(p => `<div class="sf-row"><div class="sf-im">${pimg(p)}</div><div style="min-width:0"><div class="nm">${esc(p.name)}</div><div class="muted">Sistema: <b>${p.stock || 0}</b>${p.lastCheck ? ' · conferido ' + fds(p.lastCheck) : ''}</div><div id="st-${p.id}"></div></div>
+      <input type="number" inputmode="numeric" min="0" id="sc-${p.id}" data-sc="${p.id}" aria-label="Quantidade contada de ${esc(p.name)}" placeholder="?"><button class="ok-b" data-act="stock-ok" data-id="${p.id}" aria-label="Confere: ${esc(p.name)}">✓</button></div>`).join('')}
+    <div class="sf-foot"><div class="muted" id="ssum" style="text-align:center"></div><button class="btn" id="sbtn" data-act="save-stock" disabled>Salvar conferência</button></div>`);
+  updStock();
+}
+async function saveStock(btn) {
+  const rows = stockRows().filter(p => stRes(p).t); if (!rows.length) return;
+  await run(btn, async () => {
+    let adj = 0;
+    for (const p of rows) {
+      const c = Math.max(0, Math.floor(num(F.counts[p.id]))), d = c - (p.stock || 0);
+      let vend = 0; S.sales.forEach(s => (s.items || []).forEach(i => { if (i.pid === p.id) vend += i.qty; }));
+      const upd = {stock: c, lastCheck: today(), adj: c - (initOf(p) - vend)}; if (d !== 0) adj++;
+      await db.doc('products/' + p.id).update(upd);
+    }
+    closeSheet(); toast(adj ? `Estoque conferido. ${adj} ${adj > 1 ? 'ajustes feitos' : 'ajuste feito'}.` : 'Estoque conferido. Tudo bate.');
+  });
+}
+
+function vClientes() {
+  const m = {};
+  S.sales.forEach(s => { const k = (s.customer || '').trim().toLowerCase(); (m[k] = m[k] || {name: s.customer, sales: [], owe: 0, total: 0}); const o = m[k]; o.sales.push(s); o.total += val(s); if (!s.paid) o.owe += s.total; });
+  const list = Object.entries(m).map(([k, o]) => ({k, ...o})).sort((a, b) => b.owe - a.owe || a.name.localeCompare(b.name));
+  if (!S.loaded.sales) return empty('Carregando clientes…');
+  if (!list.length) return empty('Os clientes aparecem aqui assim que você lançar a primeira venda.');
+  return `<section><p class="sub">Quanto cada cliente ainda deve e quanto já comprou.</p><div class="list">${list.map(o => {
+    const open = !!S.open[o.k];
+    const sales = o.sales.slice().sort((a, b) => (a.paid - b.paid) || (b.date || '').localeCompare(a.date || ''));
+    return `<div class="cust"><button data-act="toggle-cust" data-id="${esc(o.k)}" aria-expanded="${open}"><div><div class="who">${esc(o.name)}</div><div class="muted">${o.sales.length} ${o.sales.length > 1 ? 'compras' : 'compra'} · ${brl(o.total)} no total</div></div>
+      <div><div class="owe" style="color:${o.owe ? 'var(--warn)' : 'var(--ok)'}">${o.owe ? brl(o.owe) : 'Em dia'}</div>${o.owe ? '<div class="muted" style="text-align:right">a receber</div>' : ''}</div></button>
+      ${open ? `<div class="in">${sales.map(s => saleCard(s, {hideName: true})).join('')}</div>` : ''}</div>`;
+  }).join('')}</div></section>`;
+}
+
+function movements() {
+  const out = [];
+  S.sales.filter(s => s.paid).forEach(s => out.push({date: s.paidDate || s.date, label: 'Venda · ' + s.customer, amt: val(s), id: 's' + s.id}));
+  S.wallet.forEach(w => out.push({date: w.date, label: w.note || (w.type === 'entrada' ? 'Aporte' : w.kind === 'despesa' ? 'Despesa' : 'Retirada'), amt: w.type === 'entrada' ? w.amount : -w.amount, id: w.id, wid: w.id}));
+  return out.sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.id.localeCompare(a.id));
+}
+function vCarteira() {
+  const c = calc(), mv = movements();
+  return `<section><div class="bal"><div class="muted">Saldo disponível</div><div class="big" style="color:${c.balance < 0 ? 'var(--bad)' : 'var(--fg)'}">${brl(c.balance)}</div>
+    <div class="legend" style="margin:8px 0 14px"><span>Recebido das vendas <b>${brl(c.paid)}</b></span><span>Aportes <b>${brl(c.aporte)}</b></span><span>Saídas <b>${brl(c.out)}</b></span></div>
+    <div class="row"><button class="btn" data-act="new-wallet">Registrar compra, despesa ou retirada</button></div></div></section>
+  <section><h2>Movimentações</h2><p class="sub">Vendas pagas entram sozinhas. Compras, despesas e retiradas saem do saldo.</p>
+    ${mv.length ? `<div class="card">${mv.map(m => `<div class="mv"><span class="d">${fds(m.date)}</span><span class="t">${esc(m.label)}</span><b class="${m.amt >= 0 ? 'pos' : 'neg'}">${m.amt >= 0 ? '+' : '−'}${brl(Math.abs(m.amt))}</b>${m.wid ? `<button class="x" data-act="del-wallet" data-id="${m.wid}" aria-label="Excluir movimentação">excluir</button>` : ''}</div>`).join('')}</div>` : empty('Nada por aqui ainda. Marque uma venda como paga para o saldo começar a crescer.')}</section>`;
+}
+
+/* ---------- painel ---------- */
+const MES = ['jan','fev','mar','abr','mai','jun','jul','ago','set','out','nov','dez'];
+const MESF = ['janeiro','fevereiro','março','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro'];
+const mlabel = k => MES[+k.slice(5, 7) - 1] + '/' + k.slice(2, 4);
+const mfull = k => MESF[+k.slice(5, 7) - 1] + ' de ' + k.slice(0, 4);
+const pf = x => (Math.round(x * 10) / 10).toLocaleString('pt-BR') + '%';
+const pc = (a, b) => b > 0 ? a / b * 100 : 0;
+const mkey = s => (s.date || '').slice(0, 7);
+function prevKey(k) { let y = +k.slice(0, 4), m = +k.slice(5, 7) - 1; if (m < 1) { m = 12; y--; } return y + '-' + pad(m); }
+function pStart() {
+  const d = new Date(), y = d.getFullYear(), m = d.getMonth();
+  if (S.dp === '3m') return iso(new Date(y, m - 2, 1));
+  if (S.dp === '6m') return iso(new Date(y, m - 5, 1));
+  if (S.dp === 'ano') return y + '-01-01';
+  return '';
+}
+function monthKeys(list) {
+  const now = today().slice(0, 7);
+  let first = list.length ? list.map(s => s.date || now).sort()[0].slice(0, 7) : now;
+  const st = pStart(); if (st && st.slice(0, 7) > first) first = st.slice(0, 7);
+  const out = []; let [y, m] = first.split('-').map(Number); const [ey, em] = now.split('-').map(Number);
+  while (y < ey || (y === ey && m <= em)) { out.push(y + '-' + pad(m)); m++; if (m > 12) { m = 1; y++; } }
+  return out.slice(-12);
+}
+function agg(list) {
+  const o = {venda: 0, custo: 0, lucro: 0, n: 0, un: 0, paid: 0, pend: 0, late: 0};
+  list.forEach(s => { o.venda += val(s); o.custo += s.costTotal; o.n++; (s.items || []).forEach(i => o.un += i.qty); if (s.paid) o.paid += val(s); else { o.pend += s.total; if (late(s)) o.late += s.total; } });
+  o.lucro = o.venda - o.custo; return o;
+}
+function prodRank(list) {
+  const m = {};
+  list.forEach(s => (s.items || []).forEach(i => { const o = m[i.pid] || (m[i.pid] = {name: i.name, un: 0, rev: 0, profit: 0}); o.un += i.qty; o.rev += i.qty * i.price; o.profit += i.qty * (i.price - i.cost); }));
+  return Object.values(m);
+}
+function custRank(list) {
+  const m = {};
+  list.forEach(s => { const k = (s.customer || '').trim().toLowerCase(); const o = m[k] || (m[k] = {name: s.customer, total: 0, pend: 0, n: 0}); o.total += val(s); o.n++; if (!s.paid) o.pend += s.total; });
+  return Object.values(m);
+}
+function donut(parts) {
+  const tot = parts.reduce((a, p) => a + p.v, 0) || 1, C = 2 * Math.PI * 40; let off = 0;
+  return `<svg viewBox="0 0 100 100" aria-hidden="true"><circle cx="50" cy="50" r="40" fill="none" stroke="var(--surface2)" stroke-width="14"/>${parts.map(p => { const len = p.v / tot * C; const el = len > 0 ? `<circle cx="50" cy="50" r="40" fill="none" stroke="${p.color}" stroke-width="14" stroke-dasharray="${len} ${C - len}" stroke-dashoffset="${-off}" transform="rotate(-90 50 50)"/>` : ''; off += len; return el; }).join('')}</svg>`;
+}
+function rankRows(rows, fmt, total) {
+  const max = Math.max(1, ...rows.map(r => r.val));
+  return `<div class="rk">${rows.map(r => `<div class="r"><div class="t"><span>${esc(r.name)}</span><span><b>${fmt(r.val)}</b> <span class="muted">${pf(pc(r.val, total))}</span></span></div><div class="tr"><i style="width:${Math.max(2, r.val / max * 100)}%"></i></div></div>`).join('')}</div>`;
+}
+/* filtros por marca e produto: valem por item vendido */
+const brandOf = pid => (S.products.find(p => p.id === pid) || {}).brand || '';
+const filtOn = () => !!(S.fb || S.fp);
+const itemOk = i => (!S.fp || i.pid === S.fp) && (!S.fb || brandOf(i.pid) === S.fb);
+function fsale(s) {
+  if (!filtOn()) return s;
+  const items = (s.items || []).filter(itemOk); if (!items.length) return null;
+  const total = r2(items.reduce((a, i) => a + i.qty * i.price, 0)), cost = r2(items.reduce((a, i) => a + i.qty * i.cost, 0)), o = Object.assign({}, s, {items, total, costTotal: cost});
+  if (typeof s.received === 'number' && s.total > 0) o.received = r2(s.received * total / s.total);
+  return o;
+}
+const expIn = pred => filtOn() ? 0 : S.wallet.filter(w => w.kind === 'despesa' && pred(w.date || '')).reduce((a, w) => a + w.amount, 0);
+function dreOf(list, desp) {
+  const d = {bruta: 0, liq: 0, cmv: 0, paid: 0, pend: 0, desp: desp || 0};
+  list.forEach(s => { d.bruta += s.total; d.liq += val(s); d.cmv += s.costTotal; if (s.paid) d.paid += val(s); else d.pend += s.total; });
+  d.aj = d.liq - d.bruta; d.lb = d.liq - d.cmv; d.ll = d.lb - d.desp; return d;
+}
+const sg = v => v < 0 ? '−' + brl(-v) : brl(v);
+function dreHTML(d, p) {
+  const rows = [
+    {lb: 'Receita bruta (preço cobrado)', k: 'bruta', v: d.bruta, good: 1, cls: ''},
+    {lb: '(±) Diferença no recebimento', k: 'aj', v: d.aj, cls: 'in', novar: 1},
+    {lb: 'Receita líquida', k: 'liq', v: d.liq, good: 1, cls: 'st'},
+    {lb: '(−) Custo dos produtos vendidos', k: 'cmv', v: -d.cmv, good: 0, cls: 'in'},
+    {lb: 'Lucro bruto', k: 'lb', v: d.lb, good: 1, cls: 'st'},
+    {lb: '(−) Despesas operacionais', k: 'desp', v: -d.desp, good: 0, cls: 'in'},
+    {lb: 'Lucro líquido', k: 'll', v: d.ll, good: 1, cls: 'st'}
+  ];
+  const line = r => {
+    const pct = d.liq > 0 ? (r.v < 0 ? '−' : '') + pf(pc(Math.abs(r.v), d.liq)) : '–';
+    let vr = '';
+    if (p && !r.novar) { const a = Math.abs(r.v), b = Math.abs(p[r.k] || 0); if (b > 0) { const ch = (a - b) / b * 100, up = ch >= 0, good = (up && r.good) || (!up && !r.good); vr = `<small class="${good ? 'pos' : 'neg'}">${up ? '▲' : '▼'} ${pf(Math.abs(ch))}</small>`; } }
+    return `<div class="rw ${r.cls}"><span>${r.lb}</span><span>${sg(r.v)}</span><span class="pp">${pct}${vr}</span></div>`;
+  };
+  return `<div class="card dre"><div class="rw h"><span></span><span>Valor</span><span class="pp">% receita${p ? ' · mês ant.' : ''}</span></div>${rows.map(line).join('')}
+    <div class="rw"><span class="muted">Já recebido</span><span>${brl(d.paid)}</span><span class="pp">${d.bruta > 0 ? pf(pc(d.paid, d.liq)) : '–'}</span></div>
+    <div class="rw"><span class="muted">A receber</span><span>${brl(d.pend)}</span><span class="pp">${d.bruta > 0 ? pf(pc(d.pend, d.liq)) : '–'}</span></div></div>`;
+}
+function dreMonthly(keys, P) {
+  const cols = keys.map(k => dreOf(P.filter(s => mkey(s) === k), expIn(d => d.slice(0, 7) === k)));
+  const T = {bruta: 0, liq: 0, cmv: 0, desp: 0}; cols.forEach(c => { T.bruta += c.bruta; T.liq += c.liq; T.cmv += c.cmv; T.desp += c.desp; }); T.lb = T.liq - T.cmv; T.ll = T.lb - T.desp;
+  const all = cols.concat([T]);
+  const tr = (lb, f, cls = '') => `<tr class="${cls}"><td>${lb}</td>${all.map(c => `<td>${f(c)}</td>`).join('')}</tr>`;
+  return `<div class="card"><div class="tw"><table class="mt"><thead><tr><th></th>${keys.map(k => `<th>${mlabel(k)}</th>`).join('')}<th>Total</th></tr></thead><tbody>
+    ${tr('Receita bruta', c => brl(c.bruta))}${tr('Receita líquida', c => brl(c.liq))}${tr('(−) Custo dos produtos', c => brl(c.cmv))}${tr('Lucro bruto', c => sg(c.lb), 'st')}${tr('(−) Despesas', c => brl(c.desp))}${tr('Lucro líquido', c => sg(c.ll), 'st')}
+    ${tr('Margem bruta', c => c.liq > 0 ? pf(pc(c.lb, c.liq)) : '–', 'pcr')}${tr('Margem líquida', c => c.liq > 0 ? pf(pc(c.ll, c.liq)) : '–', 'pcr')}</tbody></table></div></div>`;
+}
+function brandRank(list) {
+  const m = {};
+  list.forEach(s => (s.items || []).forEach(i => { const b = brandOf(i.pid) || 'Sem marca', o = m[b] || (m[b] = {name: b, un: 0, rev: 0, profit: 0}); o.un += i.qty; o.rev += i.qty * i.price; o.profit += i.qty * (i.price - i.cost); }));
+  return Object.values(m);
+}
+function filterBar() {
+  const brands = [...new Set(S.products.map(p => p.brand).filter(Boolean))].sort();
+  const prods = S.products.filter(p => !S.fb || p.brand === S.fb).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  const fp = S.products.find(p => p.id === S.fp);
+  return `<section><div class="grid2"><label class="f">Marca<select id="fb"><option value="">Todas as marcas</option>${brands.map(b => `<option value="${esc(b)}" ${b === S.fb ? 'selected' : ''}>${esc(b)}</option>`).join('')}</select></label>
+    <label class="f">Produto<select id="fp"><option value="">Todos os produtos</option>${prods.map(p => `<option value="${p.id}" ${p.id === S.fp ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label></div>
+    ${filtOn() ? `<div class="row sb" style="margin-top:10px"><span class="muted">Mostrando só ${esc([S.fb, fp && fp.name].filter(Boolean).join(' · '))}</span><button class="btn ghost sm" data-act="clearf">Limpar filtros</button></div>` : ''}</section>`;
+}
+
+function vPainel() {
+  if (!S.loaded.sales || !S.loaded.products) return empty('Carregando painel…');
+  const ALL = S.sales.map(fsale).filter(Boolean), st = pStart(), P = ALL.filter(s => !st || (s.date || '') >= st);
+  const FP = S.products.filter(p => (!S.fb || p.brand === S.fb) && (!S.fp || p.id === S.fp));
+  const keys = monthKeys(P);
+  const byM = Object.fromEntries(keys.map(k => [k, agg(P.filter(s => mkey(s) === k))]));
+  const sel = keys.includes(S.dm) ? S.dm : '';
+  const scope = sel ? P.filter(s => mkey(s) === sel) : P;
+  const A = agg(scope);
+  const inWin = d => !sel ? (!st || d >= st) : (d || '').slice(0, 7) === sel;
+  const buys = S.wallet.filter(w => w.kind === 'compra' && inWin(w.date) && (!S.fp || w.pid === S.fp) && (!S.fb || brandOf(w.pid) === S.fb)).reduce((a, w) => a + w.amount, 0);
+  const D = dreOf(scope, expIn(inWin));
+  let PD = null;
+  const chip = (k, t) => `<button class="chip" data-act="dperiod" data-id="${k}" aria-pressed="${S.dp === k}">${t}</button>`;
+  let note = '';
+  if (sel) {
+    const pk = prevKey(sel), pa = agg(ALL.filter(s => mkey(s) === pk)); const pm = ALL.filter(s => mkey(s) === pk); if (pm.length) PD = dreOf(pm, expIn(d => (d || '').slice(0, 7) === pk));
+    note = pa.venda > 0 ? `<span class="${A.venda >= pa.venda ? 'pos' : 'neg'}">${A.venda >= pa.venda ? '▲' : '▼'} ${pf(Math.abs((A.venda - pa.venda) / pa.venda * 100))} vs ${mlabel(pk)}</span>` : `sem ${mlabel(pk)} para comparar`;
+  }
+  const max = Math.max(1, ...keys.map(k => Math.max(byM[k].venda, byM[k].custo, byM[k].lucro)));
+  const h = v => Math.max(0, v) / max * 100;
+  const chart = P.length ? `<div class="mplot"><div class="g" style="top:12px"><span>${brl(max)}</span></div><div class="g" style="top:92px"><span>${brl(max / 2)}</span></div><div class="g" style="top:172px"></div>
+    <div class="mchart" role="group" aria-label="Vendas, custo e lucro por mês">${keys.map(k => { const m = byM[k]; return `<button class="mcol" data-act="dmonth" data-id="${k}" aria-pressed="${k === sel}" aria-label="${mfull(k)}: vendas ${brl(m.venda)}, custo ${brl(m.custo)}, lucro ${brl(m.lucro)}"><div class="bars"><i class="bv" style="height:${h(m.venda)}%"></i><i class="bc" style="height:${h(m.custo)}%"></i><i class="bl" style="height:${h(m.lucro)}%"></i></div><div class="ml">${mlabel(k)}</div><div class="mp">${m.n ? pf(pc(m.lucro, m.venda)) : '–'}</div></button>`; }).join('')}</div></div>
+    <div class="legend" style="margin-top:6px"><span><s style="background:var(--accent)"></s>Vendas</span><span><s style="background:var(--mid)"></s>Custo</span><span><s style="background:var(--ok)"></s>Lucro</span><span>Número sob o mês: margem de lucro</span></div>` : empty('Ainda não há vendas neste período. O gráfico aparece assim que você lançar a primeira.');
+
+  /* leitura rápida */
+  const ins = [];
+  if (A.n) {
+    const withSales = keys.filter(k => byM[k].n);
+    if (!sel && withSales.length > 1) { const bm = withSales.slice().sort((a, b) => byM[b].lucro - byM[a].lucro)[0]; ins.push(`Melhor mês em lucro: ${mfull(bm)}, com ${brl(byM[bm].lucro)}.`); }
+    const pr = prodRank(scope), totP = pr.reduce((a, x) => a + x.profit, 0), tp = pr.slice().sort((a, b) => b.profit - a.profit)[0];
+    if (tp && totP > 0) ins.push(`${tp.name} gerou ${pf(pc(tp.profit, totP))} do lucro.`);
+    const cr = custRank(scope).sort((a, b) => b.total - a.total)[0];
+    if (cr && A.venda > 0) ins.push(`${cr.name} é quem mais comprou: ${pf(pc(cr.total, A.venda))} das vendas.`);
+    if (A.late > 0) ins.push(`${pf(pc(A.late, A.venda))} das vendas está atrasada (${brl(A.late)}).`);
+    else if (A.pend > 0) ins.push(`Nada em atraso. ${brl(A.pend)} a receber dentro do prazo.`);
+    else ins.push('Tudo o que foi vendido neste período já foi recebido.');
+  }
+  const unsold = FP.filter(p => !S.sales.some(s => (s.items || []).some(i => i.pid === p.id)));
+  if (unsold.length) ins.push(`${unsold.length} ${unsold.length > 1 ? 'produtos ainda não tiveram' : 'produto ainda não teve'} nenhuma venda.`);
+
+  /* pagamentos */
+  const okDays = scope.filter(s => s.paid && s.paidDate && s.date).map(s => diff(s.paidDate, s.date));
+  const avgDays = okDays.length ? Math.round(okDays.reduce((a, b) => a + b, 0) / okDays.length) : null;
+  const onTime = A.pend - A.late;
+  const pay = A.n ? `<div class="card dn"><div class="dw">${donut([{v: A.paid, color: 'var(--ok)'}, {v: onTime, color: 'var(--warn)'}, {v: A.late, color: 'var(--bad)'}])}<div><b style="font-size:22px;font-family:var(--display)">${pf(pc(A.paid, A.venda))}</b><span class="muted">recebido</span></div></div>
+    <div class="legend" style="flex-direction:column;gap:6px;flex:1;min-width:180px"><span><s style="background:var(--ok)"></s>Recebido <b>${brl(A.paid)}</b> · ${pf(pc(A.paid, A.venda))}</span><span><s style="background:var(--warn)"></s>A receber no prazo <b>${brl(onTime)}</b> · ${pf(pc(onTime, A.venda))}</span><span><s style="background:var(--bad)"></s>Atrasado <b>${brl(A.late)}</b> · ${pf(pc(A.late, A.venda))}</span><span>Prazo médio de recebimento <b>${avgDays == null ? '–' : avgDays + (avgDays === 1 ? ' dia' : ' dias')}</b></span></div></div>` : empty('Sem vendas para analisar.');
+
+  /* rankings */
+  const pr = prodRank(scope), RM = S.rm, mfmt = RM === 'un' ? v => v + ' un' : brl;
+  const prs = pr.map(x => ({name: x.name, val: x[RM]})).sort((a, b) => b.val - a.val).slice(0, 8), prTot = pr.reduce((a, x) => a + x[RM], 0);
+  const rchip = (k, t) => `<button class="chip" data-act="rank" data-id="${k}" aria-pressed="${RM === k}">${t}</button>`;
+  const cr = custRank(scope).sort((a, b) => b.total - a.total).slice(0, 6);
+  const crTot = cr.length ? custRank(scope).reduce((a, x) => a + x.total, 0) : 0;
+
+  /* margem do catálogo e estoque */
+  const marg = FP.filter(p => p.price > 0).map(p => ({name: p.name, val: (p.price - p.cost) / p.price * 100})).sort((a, b) => b.val - a.val);
+  const margRows = `<div class="rk">${marg.slice(0, 6).map(r => `<div class="r"><div class="t"><span>${esc(r.name)}</span><b>${pf(r.val)}</b></div><div class="tr"><i style="width:${Math.max(2, Math.min(100, r.val))}%"></i></div></div>`).join('')}</div>`;
+  const worst = marg[marg.length - 1];
+  const aa = agg(ALL), c = {units: 0, stUnits: 0, stCost: 0, stRev: 0, profit: aa.lucro, soldCost: aa.custo};
+  FP.forEach(p => { c.units += initOf(p); c.stUnits += p.stock || 0; c.stCost += (p.stock || 0) * p.cost; c.stRev += (p.stock || 0) * p.price; });
+  const sold = ALL.reduce((a, s) => a + (s.items || []).reduce((x, i) => x + i.qty, 0), 0), projLucro = c.profit + (c.stRev - c.stCost);
+  const brs = brandRank(scope).map(x => ({name: x.name, val: x[RM]})).sort((a, b) => b.val - a.val).slice(0, 8), brTot = brandRank(scope).reduce((a, x) => a + x[RM], 0);
+  return `
+  ${filterBar()}
+  <section><div class="chips" style="margin-bottom:0">${chip('3m', '3 meses')}${chip('6m', '6 meses')}${chip('ano', 'Este ano')}${chip('tudo', 'Tudo')}</div></section>
+  <section><h2>${sel ? mfull(sel) : 'Resumo do período'}</h2>
+    <p class="sub">${sel ? 'Toque no mês de novo para voltar ao período inteiro.' : 'Toque num mês do gráfico para ver só ele.'} Custo é o que você pagou nos produtos vendidos.</p>
+    <div class="tiles">${tile('Vendas', brl(A.venda), note || A.n + (A.n === 1 ? ' venda' : ' vendas'))}${tile('Custo', brl(A.custo), pf(pc(A.custo, A.venda)) + ' das vendas')}${tile('Lucro bruto', brl(D.lb), 'margem de ' + pf(pc(D.lb, D.liq)))}${tile('Despesas', brl(D.desp), filtOn() ? 'não entram com filtro' : pf(pc(D.desp, D.liq)) + ' da receita')}${tile('Lucro líquido', brl(D.ll), 'margem de ' + pf(pc(D.ll, D.liq)), 'hot')}${tile('Retorno sobre o custo', pf(pc(A.lucro, A.custo)), 'lucro ÷ custo')}${tile('Ticket médio', brl(A.n ? A.venda / A.n : 0), A.un + ' un vendidas')}${tile('Compras de reposição', brl(buys), 'saíram da carteira')}</div></section>
+  <section><h2>DRE · ${sel ? mfull(sel) : 'período'}</h2><p class="sub">Demonstração do resultado pela data da venda. Quando a venda já foi paga, a receita líquida usa o valor recebido.${filtOn() ? ' Despesas não são divididas por produto ou marca e ficam de fora com filtro.' : ''}</p>${A.n || D.desp ? dreHTML(D, PD) : empty('Nenhuma venda neste período.')}</section>
+  <section><h2>Vendas, custo e lucro por mês</h2><p class="sub">Cada mês mostra três barras na mesma escala.</p>${chart}</section>
+  ${P.length ? `<section><h2>DRE mês a mês</h2><p class="sub">Deslize para o lado para ver todos os meses.</p>${dreMonthly(keys, P)}</section>` : ''}
+  ${ins.length ? `<section><h2>Leitura rápida</h2><div class="card"><ul class="ins">${ins.map(t => `<li>${esc(t)}</li>`).join('')}</ul></div></section>` : ''}
+  <section><h2>Pagamentos</h2><p class="sub">Quanto do que foi vendido já virou dinheiro.</p>${pay}</section>
+  <section><h2>Produtos que mais saem</h2><div class="chips" style="margin:6px 0 10px">${rchip('rev', 'Por venda')}${rchip('profit', 'Por lucro')}${rchip('un', 'Por unidades')}</div>
+    ${prs.length ? `<div class="card">${rankRows(prs, mfmt, prTot)}</div>` : empty('Nenhuma venda neste período.')}</section>
+  ${!S.fb && brs.length ? `<section><h2>Marcas</h2><p class="sub">Mesmo critério dos botões acima.</p><div class="card">${rankRows(brs, mfmt, brTot)}</div></section>` : ''}
+  <section><h2>Clientes que mais compram</h2>${cr.length ? `<div class="card">${rankRows(cr.map(x => ({name: x.name, val: x.total})), brl, crTot)}</div>` : empty('Nenhuma venda neste período.')}</section>
+  <section><h2>Margem por produto</h2><p class="sub">Quanto do preço de venda é lucro, pelo catálogo atual.</p>${marg.length ? `<div class="card">${margRows}${worst ? `<p class="muted" style="margin:12px 0 0">Menor margem: ${esc(worst.name)}, ${pf(worst.val)}.</p>` : ''}</div>` : empty('Cadastre produtos para ver as margens.')}</section>
+  <section><h2>Estoque e projeção</h2><p class="sub">Considera todo o histórico, sem filtro de período${filtOn() ? ', só do que está filtrado' : ''}.</p>
+    <div class="card"><div class="t row sb"><span>Lote vendido</span><b>${sold} de ${c.units} un · ${pf(pc(sold, c.units))}</b></div><div class="prog" style="margin:8px 0 14px"><i style="width:${Math.min(100, pc(sold, c.units))}%"></i></div>
+    <div class="ln"><span>Dinheiro parado no estoque (custo)</span><i class="lead"></i><b>${brl(c.stCost)}</b></div>
+    <div class="ln"><span>Receita possível do estoque</span><i class="lead"></i><b>${brl(c.stRev)}</b></div>
+    <div class="ln"><span>Retorno sobre o custo até agora</span><i class="lead"></i><b>${pf(pc(c.profit, c.soldCost))}</b></div>
+    <div class="ln"><span>Lucro final se vender tudo pelo catálogo</span><i class="lead"></i><b>${brl(projLucro)}</b></div></div></section>`;
+}
+
+/* ---------- catálogo para clientes ---------- */
+const HASH = () => false;
+const clientMode = () => HASH() || S.preview;
+const cfgDoc = () => S.catalog.find(x => x.id === 'config') || SNAP.cfg || {};
+function cItems() {
+  return {items: S.products.map(p => ({id: p.id, n: p.n, name: p.name, brand: p.brand, price: p.price, img: p.img, avail: (p.stock || 0) > 0})), live: true};
+}
+const cSort = (a, b) => (a.n || 0) - (b.n || 0) || (a.name || '').localeCompare(b.name || '');
+function clientHead() {
+  const c = cfgDoc(), r = cItems();
+  return `${S.preview ? '<div class="notice row sb"><span>Prévia do que seus clientes veem.</span><button class="btn ghost sm" data-act="unpreview">Voltar</button></div>' : ''}
+  <header class="hero"><small>${esc(c.whatsapp ? 'Peça pelo WhatsApp' : 'Preços e produtos')}</small><h1>${esc(c.title || 'Catálogo de Cosméticos')}</h1>
+  <p class="muted">Toque num produto para ver os detalhes.${r.live ? '' : ' Preços de ' + esc(SNAP.date) + '.'}</p></header>`;
+}
+function vClient() {
+  const r = cItems(), q = (S.cq || '').trim().toLowerCase();
+  const brands = [...new Set(r.items.map(p => p.brand).filter(Boolean))].sort();
+  const list = r.items.slice().sort(cSort).filter(p => (!S.brand || p.brand === S.brand) && (!q || (p.name + ' ' + (p.brand || '')).toLowerCase().includes(q)));
+  const chip = (k, t) => `<button class="chip" data-act="cbrand" data-id="${esc(k)}" aria-pressed="${S.brand === k}">${esc(t)}</button>`;
+  return `<section><div class="tools"><input id="cq" type="search" placeholder="Buscar produto" value="${esc(S.cq || '')}" aria-label="Buscar produto"></div>
+    ${brands.length > 1 ? `<div class="chips">${chip('', 'Todos')}${brands.map(b => chip(b, b)).join('')}</div>` : ''}
+    ${list.length ? `<div class="cat">${list.map(p => `<button class="prod" data-act="cdetail" data-id="${esc(p.id)}"><div class="im">${pimg(p)}</div><div class="bd"><div class="nm">${esc(p.name)}</div><div class="muted">${esc(p.brand || '')}</div><div class="price">${brl(p.price)}</div>${p.avail === false ? '<div><span class="pill bad">Esgotado</span></div>' : ''}</div></button>`).join('')}</div>` : empty('Nenhum produto encontrado.')}</section>`;
+}
+function openDetail(id) {
+  const p = cItems().items.find(x => x.id === id); if (!p) return;
+  const c = cfgDoc(), d = String(c.whatsapp || '').replace(/\D/g, ''), n = d && d.length <= 11 ? '55' + d : d;
+  const href = n ? `https://wa.me/${n}?text=${encodeURIComponent('Olá! Tenho interesse em: ' + p.name + ' (' + brl(p.price) + ')')}` : '';
+  openSheet(`${head(esc(p.name))}<div class="form"><div class="prod" style="max-width:340px;margin:0 auto;width:100%"><div class="im">${pimg(p)}</div></div>
+    <div><div class="muted">${esc(p.brand || '')}</div><div class="price" style="font-size:30px">${brl(p.price)}</div>${p.avail === false ? '<span class="pill bad">Esgotado</span>' : '<span class="pill ok">Disponível</span>'}</div>
+    ${href ? `<a class="btn" style="text-align:center;text-decoration:none;display:grid;place-items:center" href="${href}" target="_blank" rel="noopener">Quero este pelo WhatsApp</a>` : ''}</div>`);
+}
+const SHARE = location.href.split('#')[0].split('?')[0].replace(/admin\/?(index\.html)?$/, '');
+function shareCard() {
+  return `<div class="card share"><div><b>Catálogo para clientes</b><div class="muted">Mostra foto, nome e preço de venda, sem custos. Muda sozinho quando você altera um valor aqui.</div></div>
+    <div class="row"><button class="btn sm" data-act="copy-link">Copiar link</button><button class="btn ghost sm" data-act="copy-list">Lista para WhatsApp</button><button class="btn ghost sm" data-act="preview">Ver como cliente</button><button class="btn ghost sm" data-act="cfg">Nome e WhatsApp</button></div></div>`;
+}
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); toast('Copiado.'); }
+  catch (e) { openSheet(`${head('Copie o texto')}<textarea id="cp" rows="10" readonly>${esc(t)}</textarea>`); const x = $('#cp'); x.focus(); x.select(); }
+}
+function waList() {
+  const c = cfgDoc(), items = S.products.slice().sort(prodSort).filter(p => (p.stock || 0) > 0);
+  return `*${c.title || 'Catálogo de Cosméticos'}*\n\n` + items.map(p => `• ${p.name}${p.brand ? ' (' + p.brand + ')' : ''}: ${brl(p.price)}`).join('\n');
+}
+function openCfg() {
+  const c = S.catalog.find(x => x.id === 'config') || {};
+  F = {kind: 'cfg', title: c.title || '', whatsapp: c.whatsapp || ''};
+  openSheet(`${head('Nome e WhatsApp')}<div class="form"><label class="f">Nome do catálogo<input data-f="title" value="${esc(F.title)}" placeholder="Ex.: Catálogo da Maria"></label>
+    <label class="f">WhatsApp com DDD<input data-f="whatsapp" inputmode="tel" value="${esc(F.whatsapp)}" placeholder="11999998888"></label>
+    <p class="muted" style="margin:0">Com o número preenchido, cada produto ganha um botão que abre uma conversa com você já com o nome do produto.</p>
+    <button class="btn" data-act="save-cfg">Salvar</button></div>`);
+}
+
+/* espelho do catálogo: só nome, marca, preço, foto e se tem estoque (nunca custo) */
+let canEdit = false, syncing = false, again = false;
+async function syncCatalog() {
+  if (!db || !canEdit || !S.loaded.products || !S.loaded.catalog) return;
+  if (syncing) { again = true; return; }
+  syncing = true;
+  try {
+    const cat = Object.fromEntries(S.catalog.map(c => [c.id, c]));
+    for (const p of S.products) {
+      const want = {n: p.n || 0, name: p.name || '', brand: p.brand || '', price: p.price || 0, img: p.img || '', avail: (p.stock || 0) > 0}, have = cat[p.id];
+      if (!have || Object.keys(want).some(k => have[k] !== want[k])) await db.doc('catalog/' + p.id).set(want);
+    }
+    for (const c of S.catalog) if (c.id !== 'config' && !S.products.some(p => p.id === c.id)) await db.doc('catalog/' + c.id).delete();
+  } catch (e) { console.error(e); }
+  finally { syncing = false; if (again) { again = false; setTimeout(syncCatalog, 400); } }
+}
+
+function render() {
+  const ae = document.activeElement, id = ae && ae.id && !ae.closest('#sheet') ? ae.id : null, ss = id && ae.selectionStart != null ? ae.selectionStart : null;
+  const c = clientMode() ? null : calc();
+  const head = c && `<div class="top"><div class="brand"><small>Cosméticos</small>Caderneta de Vendas</div><button class="chip-bal" data-act="tab" data-id="carteira" aria-label="Abrir carteira"><span>Carteira</span><b>${brl(c.balance)}</b></button><button class="btn ghost sm" data-act="logout">Sair</button></div>`;
+  const note = S.err === 'nodb' ? '<div class="notice">Não foi possível conectar ao banco de dados.</div>' : S.err ? '<div class="notice">Não foi possível carregar os dados agora. Recarregue a página.</div>' : '';
+  const CV = clientMode();
+  document.body.classList.toggle('client', CV);
+  const v = CV ? vClient() : {resumo: vResumo, painel: vPainel, catalogo: vCatalogo, vendas: vVendas, clientes: vClientes, carteira: vCarteira}[S.tab]();
+  $('#app').innerHTML = (CV ? clientHead() : head + note) + v;
+  document.querySelectorAll('nav [data-id]').forEach(b => b.setAttribute('aria-current', b.dataset.id === S.tab ? 'page' : 'false'));
+  if (id) { const el = document.getElementById(id); if (el) { el.focus(); try { el.setSelectionRange(ss, ss); } catch (e) {} } }
+}
+
+/* ---------- sheet + toast ---------- */
+function openSheet(html) { const sh = $('#sheet'); $('#sheet-body').innerHTML = html; sh.hidden = false; }
+function closeSheet() { $('#sheet').hidden = true; $('#sheet-body').innerHTML = ''; F = null; }
+let tt; function toast(m) { const t = $('#toast'); t.textContent = m; t.hidden = false; clearTimeout(tt); tt = setTimeout(() => t.hidden = true, 3200); }
+function armed(btn) {
+  if (btn.dataset.armed === '1') return true;
+  btn.dataset.armed = '1'; btn.dataset.orig = btn.textContent; btn.textContent = 'Toque de novo para confirmar'; btn.classList.add('danger');
+  setTimeout(() => { if (btn.isConnected) { btn.dataset.armed = ''; btn.textContent = btn.dataset.orig; btn.classList.remove('danger'); } }, 3500);
+  return false;
+}
+async function run(btn, fn) {
+  if (btn) btn.disabled = true;
+  try { await fn(); } catch (e) { console.error(e); toast('Não foi possível salvar. Tente de novo.'); }
+  finally { if (btn && btn.isConnected) btn.disabled = false; }
+}
+const head = (t) => `<div class="sheet-h"><h3>${t}</h3><button class="x-btn" data-act="close" aria-label="Fechar">×</button></div>`;
+
+/* ---------- nova venda ---------- */
+function saleTotals() {
+  let total = 0, cost = 0;
+  F.lines.forEach(l => { const p = S.products.find(x => x.id === l.pid); const q = Math.max(0, Math.floor(num(l.qty))); if (p) { total += q * num(l.price); cost += q * p.cost; } });
+  return {total, cost};
+}
+function updSaleTotals() {
+  const t = saleTotals(), el = $('#sum'); if (!el) return;
+  el.innerHTML = `<div><span>Total da venda</span><b>${brl(t.total)}</b></div><div><span>Custo</span><span>${brl(t.cost)}</span></div><div><span>Lucro</span><b class="${t.total - t.cost >= 0 ? 'pos' : 'neg'}">${brl(t.total - t.cost)}</b></div>`;
+  F.lines.forEach((l, i) => { const p = S.products.find(x => x.id === l.pid), n = $('#ln' + i); if (n) n.textContent = p ? `custo ${brl(p.cost)} · lucro ${brl(num(l.price) - p.cost)} por un.` : ''; });
+}
+function renderSale() {
+  const custs = [...new Set(S.sales.map(s => s.customer))].filter(Boolean).sort();
+  const prods = S.products.slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  const lines = F.lines.map((l, i) => `<div class="line ${l.check ? 'chk' : ''}">${l.check ? '<div class="flag">⚠ Confira este item</div>' : ''}
+    <select data-f="pid" data-i="${i}" aria-label="Produto"><option value="">Escolher produto</option>${prods.map(p => `<option value="${p.id}" ${p.id === l.pid ? 'selected' : ''} ${(p.stock || 0) <= 0 && p.id !== l.pid ? 'disabled' : ''}>${esc(p.name)} · ${p.stock || 0} un</option>`).join('')}</select>
+    <div class="g"><label class="f">Qtd<input data-f="qty" data-i="${i}" type="number" inputmode="numeric" min="1" value="${esc(l.qty)}"></label>
+    <label class="f">Preço de venda (R$)<input data-f="price" data-i="${i}" type="text" inputmode="decimal" value="${esc(l.price)}" placeholder="0,00"></label></div>
+    <div class="row sb"><span class="muted" id="ln${i}"></span>${F.lines.length > 1 ? `<button class="btn ghost sm" data-act="rm-line" data-id="${i}">Remover</button>` : ''}</div></div>`).join('');
+  openSheet(`${head('Nova venda')}<div class="form">
+    <label class="f">Cliente<input data-f="customer" list="custs" value="${esc(F.customer)}" placeholder="Nome do cliente" autocomplete="off"></label><datalist id="custs">${custs.map(c => `<option value="${esc(c)}">`).join('')}</datalist>
+    ${SAMPLE ? `<div class="photo">${F.photo ? `<img src="${F.photo}" alt="Foto da venda"><div><b>Preenchido pela foto</b><div class="muted">Confira os itens abaixo e corrija se precisar.${F.unknown && F.unknown.length ? `<br><span class="neg">Não achei no catálogo: ${esc(F.unknown.join(', '))}</span>` : ''}</div></div>` : ''}
+      <label class="btn ghost ${photoBusy ? 'dis' : ''}">${photoBusy ? 'Analisando a foto…' : '📷 Preencher por foto'}<input id="photo-in" type="file" accept="image/*" hidden ${photoBusy ? 'disabled' : ''}></label></div>` : ''}
+    ${lines}<button class="btn ghost" data-act="add-line">+ Outro produto</button>
+    <div class="sum" id="sum"></div>
+    <div class="seg"><label><input type="radio" name="pay" data-f="paid" value="0" ${F.paid ? '' : 'checked'}><span>Fiado</span></label><label><input type="radio" name="pay" data-f="paid" value="1" ${F.paid ? 'checked' : ''}><span>Já pagou</span></label></div>
+    ${F.paid ? `<div class="grid2"><label class="f">Valor recebido (R$)<input data-f="received" inputmode="decimal" value="${esc(F.received)}" placeholder="igual ao total"></label><label class="f">Data do pagamento<input data-f="paidDate" type="date" value="${F.paidDate}"></label></div>` : `<label class="f">Pagar até<input data-f="due" type="date" value="${F.due}"></label>`}
+    <label class="f">Observação (opcional)<input data-f="note" value="${esc(F.note)}" placeholder="Ex.: combinou pagar no dia 20"></label>
+    <div class="err-t" id="err" role="alert"></div>
+    <button class="btn" data-act="save-sale">Salvar venda</button></div>`);
+  updSaleTotals();
+}
+function openSale() { F = {kind: 'sale', customer: '', lines: [{pid: '', qty: 1, price: ''}], paid: false, due: addDays(today(), 30), paidDate: today(), received: '', note: ''}; renderSale(); }
+async function saveSale(btn) {
+  const err = m => { $('#err').textContent = m; };
+  const customer = F.customer.trim(); if (!customer) return err('Informe o nome do cliente.');
+  const items = [], need = {};
+  for (const l of F.lines) {
+    if (!l.pid && !num(l.price)) continue;
+    const p = S.products.find(x => x.id === l.pid); if (!p) return err('Escolha o produto em cada linha.');
+    const q = Math.floor(num(l.qty)), pr = num(l.price);
+    if (q < 1) return err('A quantidade deve ser 1 ou mais.'); if (pr <= 0) return err('Informe o preço de venda de ' + p.name + '.');
+    need[p.id] = (need[p.id] || 0) + q; items.push({pid: p.id, name: p.name, qty: q, cost: p.cost, price: r2(pr)});
+  }
+  if (!items.length) return err('Adicione pelo menos um produto.');
+  for (const id in need) { const p = S.products.find(x => x.id === id); if (need[id] > (p.stock || 0)) return err(`Estoque insuficiente de ${p.name}: restam ${p.stock || 0}.`); }
+  if (!F.paid && !F.due) return err('Informe até quando o cliente vai pagar.');
+  const total = r2(items.reduce((a, i) => a + i.qty * i.price, 0)), costTotal = r2(items.reduce((a, i) => a + i.qty * i.cost, 0));
+  await run(btn, async () => {
+    await db.collection('sales').doc(uid('s')).set({customer, date: today(), items, total, costTotal, paid: F.paid, paidDate: F.paid ? F.paidDate : '', received: F.paid ? (F.received.trim() && num(F.received) > 0 ? r2(num(F.received)) : total) : null, dueDate: F.paid ? '' : F.due, note: F.note.trim()});
+    for (const id in need) { const p = S.products.find(x => x.id === id); await db.doc('products/' + id).update({stock: (p.stock || 0) - need[id]}); }
+    closeSheet(); toast('Venda salva.');
+  });
+}
+
+/* ---------- receber pagamento ---------- */
+function updPay() {
+  const el = $('#pdiff'); if (!el || !F) return;
+  const d = r2(num(F.received) - F.total);
+  el.textContent = d === 0 ? 'Valor exato.' : d > 0 ? brl(d) + ' a mais que o cobrado. Entra como lucro.' : brl(-d) + ' de desconto sobre o cobrado. Sai do lucro.';
+  el.className = d < 0 ? 'warn-t' : 'muted';
+}
+function openPay(id) {
+  const s = S.sales.find(x => x.id === id); if (!s) return;
+  F = {kind: 'pay', id, total: s.total, received: fld(s.total), paidDate: today()};
+  openSheet(`${head('Receber pagamento')}<div class="form"><div class="sum"><div><span>${esc(s.customer)}</span><b>${brl(s.total)}</b></div><div><span>Valor cobrado</span><span>${brl(s.total)}</span></div></div>
+    <label class="f">Valor recebido (R$)<input data-f="received" inputmode="decimal" value="${esc(F.received)}"></label>
+    <div id="pdiff" class="muted"></div>
+    <label class="f">Data do pagamento<input data-f="paidDate" type="date" value="${F.paidDate}"></label>
+    <div class="err-t" id="err" role="alert"></div><button class="btn" data-act="save-pay">Confirmar pagamento</button></div>`);
+  updPay();
+}
+async function savePay(btn) {
+  const rec = num(F.received); if (rec <= 0) return $('#err').textContent = 'Informe o valor recebido.';
+  await run(btn, async () => { await db.doc('sales/' + F.id).update({paid: true, paidDate: F.paidDate, received: r2(rec), dueDate: ''}); closeSheet(); toast('Pagamento registrado.'); });
+}
+
+/* ---------- editar venda ---------- */
+function openEditSale(id) {
+  const s = S.sales.find(x => x.id === id); if (!s) return;
+  F = {kind: 'esale', id, customer: s.customer, note: s.note || '', paid: s.paid ? '1' : '0', due: s.dueDate || addDays(today(), 30), paidDate: s.paidDate || today(), received: fld(val(s)), total: s.total};
+  openSheet(`${head('Editar venda')}<div class="form">
+    <label class="f">Cliente<input data-f="customer" value="${esc(F.customer)}"></label>
+    <label class="f">Situação<select data-f="paid"><option value="0" ${s.paid ? '' : 'selected'}>A receber</option><option value="1" ${s.paid ? 'selected' : ''}>Pago</option></select></label>
+    <div class="grid2"><label class="f">Pagar até<input data-f="due" type="date" value="${F.due}"></label><label class="f">Pago em<input data-f="paidDate" type="date" value="${F.paidDate}"></label></div>
+    <label class="f">Valor recebido (R$)<input data-f="received" inputmode="decimal" value="${esc(F.received)}"></label>
+    <label class="f">Observação<input data-f="note" value="${esc(F.note)}"></label>
+    <div class="err-t" id="err" role="alert"></div>
+    <button class="btn" data-act="save-esale">Salvar</button>
+    <button class="btn ghost" data-act="del-sale" data-id="${id}">Excluir venda (devolve ao estoque)</button></div>`);
+}
+async function saveEditSale(btn) {
+  if (!F.customer.trim()) return $('#err').textContent = 'Informe o nome do cliente.';
+  const paid = F.paid === '1';
+  await run(btn, async () => { await db.doc('sales/' + F.id).update({customer: F.customer.trim(), note: F.note.trim(), paid, paidDate: paid ? F.paidDate : '', received: paid ? (num(F.received) > 0 ? r2(num(F.received)) : F.total) : null, dueDate: paid ? '' : F.due}); closeSheet(); toast('Venda atualizada.'); });
+}
+
+/* ---------- produto ---------- */
+function openProd(id) {
+  const p = id ? S.products.find(x => x.id === id) : null;
+  F = {kind: 'prod', id: id || '', name: p ? p.name : '', brand: p ? p.brand || '' : '', cost: p ? fld(p.cost) : '', price: p ? fld(p.price) : '', stock: p ? String(p.stock || 0) : '1', initial: p ? String(initOf(p)) : '1'};
+  openSheet(`${head(p ? 'Editar produto' : 'Novo produto')}<div class="form">
+    <label class="f">Nome<input data-f="name" value="${esc(F.name)}" placeholder="Ex.: Gloss labial"></label>
+    <label class="f">Marca<input data-f="brand" value="${esc(F.brand)}" placeholder="Ex.: Melu"></label>
+    <div class="grid2"><label class="f">Custo (R$)<input data-f="cost" inputmode="decimal" value="${esc(F.cost)}" placeholder="0,00"></label><label class="f">Preço de venda (R$)<input data-f="price" inputmode="decimal" value="${esc(F.price)}" placeholder="0,00"></label></div>
+    ${p ? `<div class="grid2"><label class="f">Em estoque<input data-f="stock" type="number" inputmode="numeric" min="0" value="${esc(F.stock)}"></label><label class="f">Total comprado<input data-f="initial" type="number" inputmode="numeric" min="0" value="${esc(F.initial)}"></label></div>` : `<label class="f">Quantidade comprada<input data-f="stock" type="number" inputmode="numeric" min="1" value="${esc(F.stock)}"></label>`}
+    <div class="err-t" id="err" role="alert"></div>
+    <button class="btn" data-act="save-prod">Salvar produto</button>
+    ${p ? '<button class="btn ghost" data-act="del-prod">Excluir produto</button>' : ''}</div>`);
+}
+async function saveProd(btn) {
+  const name = F.name.trim(); if (!name) return $('#err').textContent = 'Informe o nome do produto.';
+  const cost = num(F.cost), price = num(F.price); if (price <= 0) return $('#err').textContent = 'Informe o preço de venda.';
+  const stock = Math.max(0, Math.floor(num(F.stock)));
+  await run(btn, async () => {
+    if (F.id) await db.doc('products/' + F.id).update({name, brand: F.brand.trim(), cost: r2(cost), price: r2(price), stock, initial: Math.max(0, Math.floor(num(F.initial)))});
+    else await db.collection('products').doc(uid('p')).set({n: Date.now(), name, brand: F.brand.trim(), cost: r2(cost), price: r2(price), stock, initial: stock});
+    closeSheet(); toast('Produto salvo.');
+  });
+}
+
+/* ---------- carteira ---------- */
+function renderWallet() {
+  const prods = S.products.slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  const t = F.type, p = S.products.find(x => x.id === F.pid);
+  const qty = Math.max(0, Math.floor(num(F.qty))), unit = num(F.unit);
+  const amount = t === 'compra' ? qty * unit : num(F.amount);
+  const bal = calc().balance;
+  openSheet(`${head('Movimentar carteira')}<div class="form">
+    <div class="seg four"><label><input type="radio" name="wt" data-f="type" value="compra" ${t === 'compra' ? 'checked' : ''}><span>Comprar</span></label><label><input type="radio" name="wt" data-f="type" value="despesa" ${t === 'despesa' ? 'checked' : ''}><span>Despesa</span></label><label><input type="radio" name="wt" data-f="type" value="retirada" ${t === 'retirada' ? 'checked' : ''}><span>Retirar</span></label><label><input type="radio" name="wt" data-f="type" value="aporte" ${t === 'aporte' ? 'checked' : ''}><span>Colocar</span></label></div>
+    ${t === 'compra' ? `<label class="f">Produto<select data-f="pid"><option value="">Escolher produto</option>${prods.map(x => `<option value="${x.id}" ${x.id === F.pid ? 'selected' : ''}>${esc(x.name)} · ${x.stock || 0} un</option>`).join('')}</select></label>
+      <div class="grid2"><label class="f">Quantidade<input data-f="qty" type="number" inputmode="numeric" min="1" value="${esc(F.qty)}"></label><label class="f">Custo por unidade (R$)<input data-f="unit" inputmode="decimal" value="${esc(F.unit)}" placeholder="0,00"></label></div>
+      <p class="muted" style="margin:0">Soma ao estoque e atualiza o custo médio do produto. Produto novo? Cadastre antes no catálogo.</p>`
+    : `<label class="f">Valor (R$)<input data-f="amount" inputmode="decimal" value="${esc(F.amount)}" placeholder="0,00"></label><label class="f">Para quê (opcional)<input data-f="note" value="${esc(F.note)}" placeholder="${t === 'retirada' ? 'Ex.: pedido de novos produtos' : t === 'despesa' ? 'Ex.: frete, embalagem, taxa do Pix' : 'Ex.: dinheiro meu para o caixa'}"></label>${t === 'despesa' ? '<p class="muted" style="margin:0">Despesa entra no DRE do Painel e reduz o lucro líquido. Compra de produto não é despesa: vira estoque.</p>' : ''}`}
+    <label class="f">Data<input data-f="date" type="date" value="${F.date}"></label>
+    <div class="sum"><div><span>${t === 'aporte' ? 'Entra na carteira' : 'Sai da carteira'}</span><b id="wamt">${brl(amount)}</b></div><div><span>Saldo depois</span><b id="wafter" class="${(t === 'aporte' ? bal + amount : bal - amount) < 0 ? 'neg' : ''}">${brl(t === 'aporte' ? bal + amount : bal - amount)}</b></div></div>
+    <div class="warn-t" id="wwarn">${t !== 'aporte' && bal - amount < 0 ? 'O saldo vai ficar negativo. Você ainda pode registrar.' : ''}</div>
+    <div class="err-t" id="err" role="alert"></div>
+    <button class="btn" data-act="save-wallet">${t === 'compra' ? 'Registrar compra' : t === 'retirada' ? 'Registrar retirada' : t === 'despesa' ? 'Registrar despesa' : 'Registrar aporte'}</button></div>`);
+}
+function updWallet() {
+  const bal = calc().balance, t = F.type, amount = t === 'compra' ? Math.max(0, Math.floor(num(F.qty))) * num(F.unit) : num(F.amount), after = t === 'aporte' ? bal + amount : bal - amount;
+  $('#wamt').textContent = brl(amount); const a = $('#wafter'); a.textContent = brl(after); a.className = after < 0 ? 'neg' : '';
+  $('#wwarn').textContent = t !== 'aporte' && after < 0 ? 'O saldo vai ficar negativo. Você ainda pode registrar.' : '';
+}
+function openWallet() { F = {kind: 'wallet', type: 'compra', pid: '', qty: '1', unit: '', amount: '', note: '', date: today()}; renderWallet(); }
+async function saveWallet(btn) {
+  const t = F.type, err = m => { $('#err').textContent = m; };
+  if (t === 'compra') {
+    const p = S.products.find(x => x.id === F.pid), q = Math.floor(num(F.qty)), u = num(F.unit);
+    if (!p) return err('Escolha o produto comprado.'); if (q < 1) return err('Informe a quantidade.'); if (u <= 0) return err('Informe o custo por unidade.');
+    const st = p.stock || 0, ns = st + q, avg = st > 0 ? (st * p.cost + q * u) / ns : u;
+    await run(btn, async () => {
+      await db.doc('products/' + p.id).update({stock: ns, initial: initOf(p) + q, cost: r2(avg)});
+      await db.collection('wallet').doc(uid('w')).set({type: 'saida', kind: 'compra', amount: r2(q * u), date: F.date, note: `Compra: ${q}× ${p.name}`, pid: p.id, qty: q});
+      closeSheet(); toast('Compra registrada e estoque atualizado.');
+    });
+  } else {
+    const a = num(F.amount); if (a <= 0) return err('Informe o valor.');
+    await run(btn, async () => { await db.collection('wallet').doc(uid('w')).set({type: t === 'aporte' ? 'entrada' : 'saida', kind: t, amount: r2(a), date: F.date, note: F.note.trim()}); closeSheet(); toast('Movimentação registrada.'); });
+  }
+}
+
+/* ---------- events ---------- */
+document.addEventListener('click', async e => {
+  const b = e.target.closest('[data-act]'); if (!b) return;
+  const a = b.dataset.act, id = b.dataset.id;
+  if (a === 'tab') { S.tab = id; render(); window.scrollTo(0, 0); return; }
+  if (a === 'filter') { S.filter = id; render(); return; }
+  if (a === 'toggle-cust') { S.open[id] = !S.open[id]; render(); return; }
+  if (a === 'close') return closeSheet();
+  if (a === 'new-sale') return openSale();
+  if (a === 'new-prod') return openProd();
+  if (a === 'edit-prod') return openProd(id);
+  if (a === 'edit-sale') return openEditSale(id);
+  if (a === 'pay') return openPay(id);
+  if (a === 'new-wallet') return openWallet();
+  if (a === 'open-stock') return openStock();
+  if (a === 'stock-ok') { const p = S.products.find(x => x.id === id); if (p) { F.counts[id] = String(p.stock || 0); const i = $('#sc-' + id); if (i) i.value = F.counts[id]; updStock(); } return; }
+  if (a === 'stock-fill') { S.products.forEach(p => { F.counts[p.id] = String(p.stock || 0); const i = $('#sc-' + p.id); if (i) i.value = F.counts[p.id]; }); updStock(); return; }
+  if (a === 'stock-clear') { F.counts = {}; S.products.forEach(p => { const i = $('#sc-' + p.id); if (i) i.value = ''; }); updStock(); return; }
+  if (a === 'clearf') { S.fb = ''; S.fp = ''; render(); return; }
+  if (a === 'dperiod') { S.dp = id; S.dm = ''; render(); return; }
+  if (a === 'dmonth') { S.dm = S.dm === id ? '' : id; render(); return; }
+  if (a === 'rank') { S.rm = id; render(); return; }
+  if (a === 'cbrand') { S.brand = id; render(); return; }
+  if (a === 'cdetail') return openDetail(id);
+  if (a === 'preview') { S.preview = true; render(); window.scrollTo(0, 0); return; }
+  if (a === 'unpreview') { S.preview = false; render(); return; }
+  if (a === 'copy-link') return copyText(SHARE);
+  if (a === 'copy-list') return copyText(waList());
+  if (a === 'cfg') return openCfg();
+  if (a === 'logout') { try { await sb.auth.signOut(); } catch (e) {} location.reload(); return; }
+  if (!db) return toast('Entre com seu e-mail e senha para salvar.');
+  if (a === 'add-line') { F.lines.push({pid: '', qty: 1, price: ''}); return renderSale(); }
+  if (a === 'rm-line') { F.lines.splice(+id, 1); return renderSale(); }
+  if (a === 'save-sale') return saveSale(b);
+  if (a === 'save-esale') return saveEditSale(b);
+  if (a === 'save-prod') return saveProd(b);
+  if (a === 'save-wallet') return saveWallet(b);
+  if (a === 'save-stock') return saveStock(b);
+  if (a === 'save-cfg') return run(b, async () => { await db.doc('catalog/config').set({title: F.title.trim(), whatsapp: F.whatsapp.replace(/\D/g, '')}); closeSheet(); toast('Catálogo atualizado.'); });
+  if (a === 'save-pay') return savePay(b);
+  if (a === 'unpay') return run(b, () => { const s = S.sales.find(x => x.id === id); return db.doc('sales/' + id).update({paid: false, paidDate: '', received: null, dueDate: addDays(today(), 30)}); });
+  if (a === 'del-sale') {
+    if (!armed(b)) return;
+    const s = S.sales.find(x => x.id === id); if (!s) return;
+    return run(b, async () => {
+      for (const i of s.items || []) { const p = S.products.find(x => x.id === i.pid); if (p) await db.doc('products/' + p.id).update({stock: (p.stock || 0) + i.qty}); }
+      await db.doc('sales/' + id).delete(); closeSheet(); toast('Venda excluída e estoque devolvido.');
+    });
+  }
+  if (a === 'del-prod') { if (!armed(b)) return; return run(b, async () => { await db.doc('products/' + F.id).delete(); closeSheet(); toast('Produto excluído.'); }); }
+  if (a === 'del-wallet') { if (!armed(b)) return; return run(b, () => db.doc('wallet/' + id).delete()); }
+});
+const sheetEl = $('#sheet');
+sheetEl.addEventListener('click', e => { if (e.target === sheetEl) closeSheet(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !sheetEl.hidden) closeSheet(); });
+sheetEl.addEventListener('input', e => {
+  const t = e.target; if (F && F.kind === 'stock' && t.dataset.sc) { F.counts[t.dataset.sc] = t.value; updStock(); return; }
+  const f = t.dataset.f; if (!F || !f) return;
+  if (t.dataset.i != null) F.lines[+t.dataset.i][f] = t.value; else F[f] = t.value;
+  if (F.kind === 'sale') updSaleTotals(); if (F.kind === 'wallet') updWallet(); if (F.kind === 'pay') updPay();
+});
+sheetEl.addEventListener('change', async e => {
+  const t0 = e.target; if (t0.id === 'photo-in' && F && F.kind === 'sale' && SAMPLE && t0.files[0]) {
+    const file = t0.files[0], cur = F; photoBusy = true; renderSale();
+    try { const r = await photoToSale(file); if (F !== cur) return;
+      if (r.customer && !F.customer) F.customer = r.customer;
+      const keep = F.lines.filter(l => l.pid); F.lines = keep.concat(r.lines); if (!F.lines.length) F.lines = [{pid: '', qty: 1, price: ''}];
+      F.photo = r.url; F.unknown = r.unknown; if (!r.lines.length) toast('Não reconheci produtos do catálogo na foto.');
+    } catch (err) { const c = err && err.code; if (c === 'not_granted' || c === 'images_unavailable') SAMPLE = null; toast(ERRPH[c] || 'Não consegui analisar a foto.'); }
+    photoBusy = false; if (F === cur) renderSale(); return; }
+  const t = e.target, f = t.dataset.f; if (!F || !f) return;
+  if (F.kind === 'sale' && f === 'pid') { const l = F.lines[+t.dataset.i], p = S.products.find(x => x.id === t.value); l.pid = t.value; if (p) l.price = fld(p.price); l.check = false; return renderSale(); }
+  if (F.kind === 'sale' && f === 'paid') { F.paid = t.value === '1'; return renderSale(); }
+  if (F.kind === 'wallet' && f === 'type') { F.type = t.value; return renderWallet(); }
+  if (F.kind === 'wallet' && f === 'pid') { const p = S.products.find(x => x.id === t.value); F.pid = t.value; if (p) F.unit = fld(p.cost); return renderWallet(); }
+});
+$('#app').addEventListener('input', e => { if (e.target.id === 'q') { S.q = e.target.value; render(); } if (e.target.id === 'cq') { S.cq = e.target.value; render(); } });
+$('#app').addEventListener('change', e => {
+  if (e.target.id === 'fb') { S.fb = e.target.value; const p = S.products.find(x => x.id === S.fp); if (p && S.fb && p.brand !== S.fb) S.fp = ''; render(); }
+  if (e.target.id === 'fp') { S.fp = e.target.value; render(); }
+  if (e.target.id === 'fv') { S.fv = e.target.value; render(); }
+});
+window.addEventListener('hashchange', render);
+
+/* ---------- data ---------- */
+function sub(col) {
+  db.collection(col).onSnapshot(snap => { S[col] = snap.docs.map(d => ({id: d.id, ...d.data()})); S.loaded[col] = true; render(); },
+    e => { if (col === 'catalog') { S.loaded.catalog = true; render(); } else { S.err = e.code || 'err'; render(); } });
+}
+
+/* ---------- banco: Supabase (cada coleção é uma tabela id + data jsonb) ---------- */
+function makeDb(sb) {
+  const TB = {products: 'products', sales: 'sales', wallet: 'wallet', catalog: 'config'};
+  const cache = {}, ls = {};
+  const snap = c => ({docs: Object.entries(cache[c] || {}).map(([id, d]) => ({id, data: () => d}))});
+  const emit = c => (ls[c] || []).forEach(f => f.next(snap(c)));
+  async function load(c) {
+    const r = await sb.from(TB[c]).select('id,data'); if (r.error) throw r.error;
+    cache[c] = Object.fromEntries(r.data.map(x => [x.id, x.data])); emit(c);
+  }
+  function dref(c, id) {
+    const ref = {
+      async set(d) { const r = await sb.from(TB[c]).upsert({id, data: d, updated_at: new Date().toISOString()}); if (r.error) throw r.error; (cache[c] = cache[c] || {})[id] = d; emit(c); },
+      async update(d) { const cur = (cache[c] || {})[id]; if (!cur) throw new Error('Registro não encontrado'); await ref.set(Object.assign({}, cur, d)); },
+      async delete() { const r = await sb.from(TB[c]).delete().eq('id', id); if (r.error) throw r.error; if (cache[c]) delete cache[c][id]; emit(c); }
+    };
+    return ref;
+  }
+  return {
+    collection: c => ({ onSnapshot(next, err) { (ls[c] = ls[c] || []).push({next}); load(c).catch(e => err && err({code: e.code || 'err'})); return () => {}; }, doc: id => dref(c, id) }),
+    doc: p => { const k = p.split('/'); return dref(k[0], k[1]); },
+    reload: () => Promise.all(Object.keys(ls).map(c => load(c).catch(() => {})))
+  };
+}
+
+/* ---------- login ---------- */
+const CFG = window.APP_CONFIG || {};
+let sb = null;
+function showLogin(msg) {
+  document.body.classList.add('locked'); $('#login').hidden = false;
+  if (msg) $('#login-err').textContent = msg;
+}
+function enter() {
+  document.body.classList.remove('locked'); $('#login').hidden = true;
+  db = makeDb(sb);
+  ['products', 'sales', 'wallet', 'catalog'].forEach(sub);
+  const again = () => { if (document.visibilityState === 'visible') db.reload(); };
+  document.addEventListener('visibilitychange', again); setInterval(again, 60000);
+}
+$('#login-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const btn = $('#login-btn'), err = $('#login-err'); err.textContent = ''; btn.disabled = true;
+  try {
+    const r = await sb.auth.signInWithPassword({email: $('#login-email').value.trim(), password: $('#login-pass').value});
+    if (r.error) err.textContent = 'E-mail ou senha incorretos.'; else { $('#login-pass').value = ''; enter(); }
+  } catch (x) { err.textContent = 'Não foi possível entrar agora. Tente de novo.'; }
+  btn.disabled = false;
+});
+render();
+(async () => {
+  if (!CFG.SUPABASE_URL || /SEU-PROJETO/.test(CFG.SUPABASE_URL) || !window.supabase) { showLogin('Falta preencher o arquivo config.js com os dados do seu Supabase.'); return; }
+  sb = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY);
+  sb.auth.onAuthStateChange(ev => { if (ev === 'SIGNED_OUT' && db) location.reload(); });
+  let s = null; try { s = (await sb.auth.getSession()).data.session; } catch (e) {}
+  if (s) enter(); else showLogin();
+})();
+})();
