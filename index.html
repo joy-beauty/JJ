@@ -137,6 +137,7 @@ nav svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.8;st
 .fab{position:fixed;z-index:15;right:max(16px,env(safe-area-inset-right,0px));bottom:calc(76px + env(safe-area-inset-bottom,0px));
   box-shadow:var(--shadow);border-radius:999px;padding:0 20px;min-height:50px;font-size:16px}
 
+[hidden]{display:none!important}
 #sheet{position:fixed;inset:0;z-index:40;background:rgba(20,12,24,.5);display:flex;align-items:flex-end;justify-content:center}
 .sheet{background:var(--bg);width:100%;max-width:560px;max-height:92dvh;overflow:auto;border-radius:20px 20px 0 0;
   padding:16px max(16px,env(safe-area-inset-right,0px)) calc(20px + env(safe-area-inset-bottom,0px)) max(16px,env(safe-area-inset-left,0px));box-shadow:var(--shadow)}
@@ -243,7 +244,7 @@ function render() {
   $('#app').innerHTML = `<header class="hero"><small>${cfg.whatsapp ? 'Peça pelo WhatsApp' : 'Preços e produtos'}</small><h1>${esc(title)}</h1><p class="muted">Toque num produto para ver os detalhes.</p></header>
   <section><div class="tools"><input id="cq" type="search" placeholder="Buscar produto" value="${esc(q)}" aria-label="Buscar produto"></div>
   ${brands.length > 1 ? `<div class="chips">${chip('', 'Todos')}${brands.map(b => chip(b, b)).join('')}</div>` : ''}
-  ${!loaded ? '<div class="empty">Carregando catálogo…</div>' : failed && !items.length ? '<div class="empty">Não foi possível carregar o catálogo agora. Tente de novo em instantes.</div>' : list.length ? `<div class="cat">${list.map(p => `<button class="prod" data-id="${esc(p.id)}"><div class="im">${pimg(p)}</div><div class="bd"><div class="nm">${esc(p.name)}</div><div class="muted">${esc(p.brand || '')}</div><div class="price">${brl(p.price)}</div>${p.avail === false ? '<div><span class="pill bad">Esgotado</span></div>' : ''}</div></button>`).join('')}</div>` : '<div class="empty">Nenhum produto encontrado.</div>'}</section>`;
+  ${!loaded ? '<div class="empty">Carregando catálogo…</div>' : failed && !items.length ? '<div class="empty">Não foi possível carregar o catálogo agora. Tente de novo em instantes.<br><small style="opacity:.6">Detalhe técnico: ' + esc(errMsg) + '</small></div>' : list.length ? `<div class="cat">${list.map(p => `<button class="prod" data-id="${esc(p.id)}"><div class="im">${pimg(p)}</div><div class="bd"><div class="nm">${esc(p.name)}</div><div class="muted">${esc(p.brand || '')}</div><div class="price">${brl(p.price)}</div>${p.avail === false ? '<div><span class="pill bad">Esgotado</span></div>' : ''}</div></button>`).join('')}</div>` : '<div class="empty">Nenhum produto encontrado.</div>'}</section>`;
   const e = document.activeElement; if (e && e.id === 'cq') { /* mantém foco na busca */ }
 }
 function detail(id) {
@@ -263,16 +264,17 @@ document.addEventListener('click', e => {
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSheet(); });
 $('#app').addEventListener('input', e => { if (e.target.id === 'cq') { q = e.target.value; const pos = e.target.selectionStart; render(); const n = $('#cq'); n.focus(); try { n.setSelectionRange(pos, pos); } catch (x) {} } });
+let errMsg = '';
 async function load() {
   try {
     const [a, b] = await Promise.all([sb.from('public_catalog').select('*').order('n'), sb.from('public_config').select('*')]);
     if (a.error) throw a.error; items = a.data || []; cfg = (b.data && b.data[0]) || {}; failed = false;
-  } catch (e) { failed = true; }
+  } catch (e) { failed = true; errMsg = (e && (e.message || e.code)) || String(e); console.error(e); }
   loaded = true;
   const act = document.activeElement; if (act && act.id === 'cq') return; render();
 }
 render();
-if (!CFG.SUPABASE_URL || /SEU-PROJETO/.test(CFG.SUPABASE_URL) || !window.supabase) { loaded = true; failed = true; render(); }
+if (!CFG.SUPABASE_URL || /SEU-PROJETO/.test(CFG.SUPABASE_URL) || !window.supabase) { loaded = true; failed = true; errMsg = !window.supabase ? 'biblioteca supabase-js não carregou' : 'config.js não preenchido'; render(); }
 else { sb = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY); load(); setInterval(() => { if (document.visibilityState === 'visible') load(); }, 60000); }
 })();
 </script>
