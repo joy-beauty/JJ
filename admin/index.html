@@ -447,7 +447,7 @@ function vCarteira() {
   const c = calc(), mv = movements();
   return `<section><div class="bal"><div class="muted">Saldo disponível</div><div class="big" style="color:${c.balance < 0 ? 'var(--bad)' : 'var(--fg)'}">${brl(c.balance)}</div>
     <div class="legend" style="margin:8px 0 14px"><span>Recebido das vendas <b>${brl(c.paid)}</b></span><span>Aportes <b>${brl(c.aporte)}</b></span><span>Saídas <b>${brl(c.out)}</b></span></div>
-    <div class="row"><button class="btn" data-act="new-wallet">Registrar compra, despesa ou retirada</button></div></div></section>
+    <div class="row"><button class="btn" data-act="new-wallet">Registrar compra ou movimentação</button></div></div></section>
   <section><h2>Movimentações</h2><p class="sub">Vendas pagas entram sozinhas. Compras, despesas e retiradas saem do saldo.</p>
     ${mv.length ? `<div class="card">${mv.map(m => `<div class="mv"><span class="d">${fds(m.date)}</span><span class="t">${esc(m.label)}</span><b class="${m.amt >= 0 ? 'pos' : 'neg'}">${m.amt >= 0 ? '+' : '−'}${brl(Math.abs(m.amt))}</b>${m.wid ? `<button class="x" data-act="del-wallet" data-id="${m.wid}" aria-label="Excluir movimentação">excluir</button>` : ''}</div>`).join('')}</div>` : empty('Nada por aqui ainda. Marque uma venda como paga para o saldo começar a crescer.')}</section>`;
 }
@@ -887,12 +887,70 @@ function renderWallet() {
     <div class="err-t" id="err" role="alert"></div>
     <button class="btn" data-act="save-wallet">${t === 'compra' ? 'Registrar compra' : t === 'retirada' ? 'Registrar retirada' : t === 'despesa' ? 'Registrar despesa' : 'Registrar aporte'}</button></div>`);
 }
+/* ---------- compra de produtos (custo médio) ---------- */
+const NEWP = '__new';
+function buyCalc() {
+  const L = F.lines.map(l => ({qty: Math.max(0, Math.floor(num(l.qty))), unit: num(l.unit)}));
+  const sub = L.reduce((a, l) => a + l.qty * l.unit, 0), fr = Math.max(0, num(F.freight)), run = {};
+  const lines = F.lines.map((l, i) => {
+    const q = L[i].qty, u = L[i].unit, eff = q > 0 ? u + (sub > 0 ? fr * (q * u / sub) / q : 0) : u;
+    const key = l.pid === NEWP ? 'n' + i : l.pid, p = S.products.find(x => x.id === l.pid);
+    if (key && run[key] == null) run[key] = {st: p ? p.stock || 0 : 0, cost: p ? num(p.cost) : 0, init: p ? initOf(p) : 0, old: p ? num(p.cost) : null};
+    const r = key ? run[key] : null; let avg = eff;
+    if (r && q > 0) { avg = r.st > 0 ? (r.st * r.cost + q * eff) / (r.st + q) : eff; r.cost = avg; r.st += q; r.init += q; }
+    return {q, u, eff, avg, old: r ? r.old : null, key, amount: q * eff};
+  });
+  return {lines, sub, fr, total: sub + fr, run};
+}
+function renderBuy() {
+  const prods = S.products.slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  const lines = F.lines.map((l, i) => `<div class="line">
+    <select data-f="pid" data-i="${i}" aria-label="Produto"><option value="">Escolher produto</option><option value="${NEWP}" ${l.pid === NEWP ? 'selected' : ''}>➕ Produto novo (cadastrar agora)</option>${prods.map(x => `<option value="${x.id}" ${x.id === l.pid ? 'selected' : ''}>${esc(x.name)} · ${x.stock || 0} un · custo ${brl(x.cost)}</option>`).join('')}</select>
+    ${l.pid === NEWP ? `<label class="f">Nome<input data-f="name" data-i="${i}" value="${esc(l.name)}" placeholder="Ex.: Gloss labial"></label><div class="grid2"><label class="f">Marca<input data-f="brand" data-i="${i}" value="${esc(l.brand)}" placeholder="Ex.: Melu"></label><label class="f">Preço de venda (R$)<input data-f="price" data-i="${i}" inputmode="decimal" value="${esc(l.price)}" placeholder="0,00"></label></div>` : ''}
+    <div class="grid2"><label class="f">Quantidade<input data-f="qty" data-i="${i}" type="number" inputmode="numeric" min="1" value="${esc(l.qty)}"></label><label class="f">Preço de compra (un.)<input data-f="unit" data-i="${i}" inputmode="decimal" value="${esc(l.unit)}" placeholder="0,00"></label></div>
+    <div class="row sb"><span class="muted" id="bl${i}"></span>${F.lines.length > 1 ? `<button class="btn ghost sm" data-act="rm-bline" data-id="${i}">Remover</button>` : ''}</div></div>`).join('');
+  openSheet(`${head('Registrar compra')}<div class="form">
+    ${lines}<button class="btn ghost" data-act="add-bline">+ Outro produto</button>
+    <div class="grid2"><label class="f">Frete / extras (R$)<input data-f="freight" inputmode="decimal" value="${esc(F.freight)}" placeholder="0,00"></label><label class="f">Data<input data-f="date" type="date" value="${F.date}"></label></div>
+    <p class="muted" style="margin:0">O frete é dividido entre os produtos e entra no custo. O custo médio considera o que você ainda tem em estoque.</p>
+    <div class="sum" id="bsum"></div><div class="warn-t" id="wwarn"></div>
+    <div class="err-t" id="err" role="alert"></div>
+    <button class="btn" data-act="save-buy">Registrar compra</button>
+    <button class="btn ghost" data-act="other-wallet">Despesa, retirada ou aporte</button></div>`);
+  updBuy();
+}
+function updBuy() {
+  const c = buyCalc(), el = $('#bsum'); if (!el) return; const bal = calc().balance, after = bal - c.total;
+  el.innerHTML = `<div><span>Total da compra</span><b>${brl(c.total)}</b></div><div><span>Saldo da carteira depois</span><b class="${after < 0 ? 'neg' : ''}">${brl(after)}</b></div>`;
+  $('#wwarn').textContent = after < 0 ? 'O saldo vai ficar negativo. Você ainda pode registrar.' : '';
+  c.lines.forEach((l, i) => { const n = $('#bl' + i); if (!n) return; const pr = F.lines[i];
+    n.textContent = !pr.pid || l.q < 1 ? '' : pr.pid === NEWP ? `custo ${brl(l.avg)} por un.` : `custo médio: ${brl(l.old)} → ${brl(l.avg)}${l.eff !== l.u ? ` (já com frete: ${brl(l.eff)} por un.)` : ''}`; });
+}
+function openBuy() { F = {kind: 'buy', date: today(), freight: '', lines: [{pid: '', qty: '1', unit: '', name: '', brand: '', price: ''}]}; renderBuy(); }
+async function saveBuy(btn) {
+  const err = m => { $('#err').textContent = m; }, c = buyCalc();
+  for (let i = 0; i < F.lines.length; i++) { const l = F.lines[i], n = i + 1;
+    if (!l.pid) return err(`Produto ${n}: escolha o produto.`);
+    if (l.pid === NEWP) { if (!l.name.trim()) return err(`Produto ${n}: informe o nome.`); if (num(l.price) <= 0) return err(`Produto ${n}: informe o preço de venda.`); }
+    if (c.lines[i].q < 1) return err(`Produto ${n}: informe a quantidade.`); if (c.lines[i].u <= 0) return err(`Produto ${n}: informe o preço de compra.`); }
+  await run(btn, async () => {
+    const done = {};
+    for (let i = 0; i < F.lines.length; i++) { const l = F.lines[i], k = c.lines[i], key = k.key, r = c.run[key], when = F.date;
+      let pid = l.pid;
+      if (pid === NEWP) { pid = uid('p'); await db.collection('products').doc(pid).set({n: Date.now() + i, name: l.name.trim(), brand: l.brand.trim(), cost: r2(r.cost), price: r2(num(l.price)), stock: r.st, initial: r.init}); }
+      else if (!done[key]) { await db.doc('products/' + pid).update({stock: r.st, initial: r.init, cost: r2(r.cost)}); done[key] = 1; }
+      const name = l.pid === NEWP ? l.name.trim() : (S.products.find(x => x.id === l.pid) || {}).name;
+      await db.collection('wallet').doc(uid('w')).set({type: 'saida', kind: 'compra', amount: r2(k.amount), date: when, note: `Compra: ${k.q}× ${name}`, pid, qty: k.q});
+    }
+    closeSheet(); toast('Compra registrada, estoque e custo médio atualizados.');
+  });
+}
 function updWallet() {
   const bal = calc().balance, t = F.type, amount = t === 'compra' ? Math.max(0, Math.floor(num(F.qty))) * num(F.unit) : num(F.amount), after = t === 'aporte' ? bal + amount : bal - amount;
   $('#wamt').textContent = brl(amount); const a = $('#wafter'); a.textContent = brl(after); a.className = after < 0 ? 'neg' : '';
   $('#wwarn').textContent = t !== 'aporte' && after < 0 ? 'O saldo vai ficar negativo. Você ainda pode registrar.' : '';
 }
-function openWallet() { F = {kind: 'wallet', type: 'compra', pid: '', qty: '1', unit: '', amount: '', note: '', date: today()}; renderWallet(); }
+function openWallet() { F = {kind: 'wallet', type: 'despesa', pid: '', qty: '1', unit: '', amount: '', note: '', date: today()}; renderWallet(); }
 async function saveWallet(btn) {
   const t = F.type, err = m => { $('#err').textContent = m; };
   if (t === 'compra') {
@@ -923,7 +981,8 @@ document.addEventListener('click', async e => {
   if (a === 'edit-prod') return openProd(id);
   if (a === 'edit-sale') return openEditSale(id);
   if (a === 'pay') return openPay(id);
-  if (a === 'new-wallet') return openWallet();
+  if (a === 'new-wallet') return openBuy();
+  if (a === 'other-wallet') return openWallet();
   if (a === 'open-stock') return openStock();
   if (a === 'stock-ok') { const p = S.products.find(x => x.id === id); if (p) { F.counts[id] = String(p.stock || 0); const i = $('#sc-' + id); if (i) i.value = F.counts[id]; updStock(); } return; }
   if (a === 'stock-fill') { S.products.forEach(p => { F.counts[p.id] = String(p.stock || 0); const i = $('#sc-' + p.id); if (i) i.value = F.counts[p.id]; }); updStock(); return; }
@@ -941,6 +1000,9 @@ document.addEventListener('click', async e => {
   if (a === 'cfg') return openCfg();
   if (a === 'logout') { try { await sb.auth.signOut(); } catch (e) {} location.reload(); return; }
   if (!db) return toast('Entre com seu e-mail e senha para salvar.');
+  if (a === 'add-bline') { F.lines.push({pid: '', qty: '1', unit: '', name: '', brand: '', price: ''}); return renderBuy(); }
+  if (a === 'rm-bline') { F.lines.splice(+id, 1); return renderBuy(); }
+  if (a === 'save-buy') return saveBuy(b);
   if (a === 'add-line') { F.lines.push({pid: '', qty: 1, price: ''}); return renderSale(); }
   if (a === 'rm-line') { F.lines.splice(+id, 1); return renderSale(); }
   if (a === 'save-sale') return saveSale(b);
@@ -969,7 +1031,7 @@ sheetEl.addEventListener('input', e => {
   const t = e.target; if (F && F.kind === 'stock' && t.dataset.sc) { F.counts[t.dataset.sc] = t.value; updStock(); return; }
   const f = t.dataset.f; if (!F || !f) return;
   if (t.dataset.i != null) F.lines[+t.dataset.i][f] = t.value; else F[f] = t.value;
-  if (F.kind === 'sale') updSaleTotals(); if (F.kind === 'wallet') updWallet(); if (F.kind === 'pay') updPay();
+  if (F.kind === 'sale') updSaleTotals(); if (F.kind === 'wallet') updWallet(); if (F.kind === 'pay') updPay(); if (F.kind === 'buy') updBuy();
 });
 sheetEl.addEventListener('change', async e => {
   const t0 = e.target; if (t0.id === 'photo-in' && F && F.kind === 'sale' && SAMPLE && t0.files[0]) {
@@ -983,7 +1045,8 @@ sheetEl.addEventListener('change', async e => {
   const t = e.target, f = t.dataset.f; if (!F || !f) return;
   if (F.kind === 'sale' && f === 'pid') { const l = F.lines[+t.dataset.i], p = S.products.find(x => x.id === t.value); l.pid = t.value; if (p) l.price = fld(p.price); l.check = false; return renderSale(); }
   if (F.kind === 'sale' && f === 'paid') { F.paid = t.value === '1'; return renderSale(); }
-  if (F.kind === 'wallet' && f === 'type') { F.type = t.value; return renderWallet(); }
+  if (F.kind === 'buy' && f === 'pid') { const l = F.lines[+t.dataset.i], p = S.products.find(x => x.id === t.value); l.pid = t.value; if (p && !l.unit) l.unit = fld(p.cost); return renderBuy(); }
+  if (F.kind === 'wallet' && f === 'type') { if (t.value === 'compra') return openBuy(); F.type = t.value; return renderWallet(); }
   if (F.kind === 'wallet' && f === 'pid') { const p = S.products.find(x => x.id === t.value); F.pid = t.value; if (p) F.unit = fld(p.cost); return renderWallet(); }
 });
 $('#app').addEventListener('input', e => { if (e.target.id === 'q') { S.q = e.target.value; render(); } if (e.target.id === 'cq') { S.cq = e.target.value; render(); } });
@@ -1044,8 +1107,8 @@ $('#login-form').addEventListener('submit', async e => {
   const btn = $('#login-btn'), err = $('#login-err'); err.textContent = ''; btn.disabled = true;
   try {
     const r = await sb.auth.signInWithPassword({email: $('#login-email').value.trim(), password: $('#login-pass').value});
-    if (r.error) err.textContent = 'E-mail ou senha incorretos.'; else { $('#login-pass').value = ''; enter(); }
-  } catch (x) { err.textContent = 'Não foi possível entrar agora. Tente de novo.'; }
+    if (r.error) err.textContent = /invalid login/i.test(r.error.message || '') ? 'E-mail ou senha incorretos.' : 'Não entrou: ' + (r.error.message || r.error.code || 'erro') + (r.error.status ? ' (' + r.error.status + ')' : ''); else { $('#login-pass').value = ''; enter(); }
+  } catch (x) { console.error(x); err.textContent = 'Não foi possível entrar agora. Detalhe técnico: ' + ((x && (x.message || x.name)) || String(x)); }
   btn.disabled = false;
 });
 render();
