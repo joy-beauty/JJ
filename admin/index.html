@@ -294,6 +294,8 @@ async function photoToSale(file) {
 
 /* ---------- derived numbers ---------- */
 const initOf = p => p.initial != null ? p.initial : (p.stock || 0);
+// quanto já foi investido no produto (soma de todas as compras); não muda quando o custo médio muda
+const spentOf = p => p.spent != null ? p.spent : num(p.cost) * initOf(p);
 const late = s => !s.paid && s.dueDate && s.dueDate < today();
 const val = s => (s.paid && s.received != null) ? s.received : s.total;
 function status(s) {
@@ -308,7 +310,7 @@ function status(s) {
 }
 function calc() {
   const c = {lotCost: 0, lotRev: 0, stCost: 0, stRev: 0, units: 0, stUnits: 0, sold: 0, paid: 0, pend: 0, late: 0, soldCost: 0, inn: 0, out: 0, aporte: 0};
-  S.products.forEach(p => { const i = initOf(p), st = p.stock || 0; c.lotCost += p.cost * i; c.lotRev += p.price * i; c.stCost += p.cost * st; c.stRev += p.price * st; c.units += i; c.stUnits += st; });
+  S.products.forEach(p => { const i = initOf(p), st = p.stock || 0; c.lotCost += spentOf(p); c.lotRev += p.price * i; c.stCost += p.cost * st; c.stRev += p.price * st; c.units += i; c.stUnits += st; });
   S.sales.forEach(s => { c.sold += val(s); c.soldCost += s.costTotal; if (s.paid) c.paid += val(s); else { c.pend += s.total; if (late(s)) c.late += s.total; } });
   S.wallet.forEach(w => { if (w.type === 'entrada') c.aporte += w.amount; else c.out += w.amount; });
   c.profit = c.sold - c.soldCost;
@@ -862,8 +864,8 @@ async function saveProd(btn) {
   const cost = num(F.cost), price = num(F.price); if (price <= 0) return $('#err').textContent = 'Informe o preço de venda.';
   const stock = Math.max(0, Math.floor(num(F.stock)));
   await run(btn, async () => {
-    if (F.id) await db.doc('products/' + F.id).update({name, brand: F.brand.trim(), cost: r2(cost), price: r2(price), stock, initial: Math.max(0, Math.floor(num(F.initial)))});
-    else await db.collection('products').doc(uid('p')).set({n: Date.now(), name, brand: F.brand.trim(), cost: r2(cost), price: r2(price), stock, initial: stock});
+    if (F.id) { const old = S.products.find(x => x.id === F.id) || {}, ni = Math.max(0, Math.floor(num(F.initial))); await db.doc('products/' + F.id).update({name, brand: F.brand.trim(), cost: r2(cost), price: r2(price), stock, initial: ni, spent: r2(Math.max(0, spentOf(old) + (ni - initOf(old)) * cost))}); }
+    else await db.collection('products').doc(uid('p')).set({n: Date.now(), name, brand: F.brand.trim(), cost: r2(cost), price: r2(price), stock, initial: stock, spent: r2(cost * stock)});
     closeSheet(); toast('Produto salvo.');
   });
 }
@@ -895,9 +897,9 @@ function buyCalc() {
   const lines = F.lines.map((l, i) => {
     const q = L[i].qty, u = L[i].unit, eff = q > 0 ? u + (sub > 0 ? fr * (q * u / sub) / q : 0) : u;
     const key = l.pid === NEWP ? 'n' + i : l.pid, p = S.products.find(x => x.id === l.pid);
-    if (key && run[key] == null) run[key] = {st: p ? p.stock || 0 : 0, cost: p ? num(p.cost) : 0, init: p ? initOf(p) : 0, old: p ? num(p.cost) : null};
+    if (key && run[key] == null) run[key] = {st: p ? p.stock || 0 : 0, cost: p ? num(p.cost) : 0, init: p ? initOf(p) : 0, spent: p ? spentOf(p) : 0, old: p ? num(p.cost) : null};
     const r = key ? run[key] : null; let avg = eff;
-    if (r && q > 0) { avg = r.st > 0 ? (r.st * r.cost + q * eff) / (r.st + q) : eff; r.cost = avg; r.st += q; r.init += q; }
+    if (r && q > 0) { avg = r.st > 0 ? (r.st * r.cost + q * eff) / (r.st + q) : eff; r.cost = avg; r.st += q; r.init += q; r.spent += q * eff; }
     return {q, u, eff, avg, old: r ? r.old : null, key, amount: q * eff};
   });
   return {lines, sub, fr, total: sub + fr, run};
@@ -912,7 +914,7 @@ function renderBuy() {
   openSheet(`${head('Registrar compra')}<div class="form">
     ${lines}<button class="btn ghost" data-act="add-bline">+ Outro produto</button>
     <div class="grid2"><label class="f">Frete / extras (R$)<input data-f="freight" inputmode="decimal" value="${esc(F.freight)}" placeholder="0,00"></label><label class="f">Data<input data-f="date" type="date" value="${F.date}"></label></div>
-    <p class="muted" style="margin:0">O frete é dividido entre os produtos e entra no custo. O custo médio considera o que você ainda tem em estoque.</p>
+    <p class="muted" style="margin:0">O custo médio vale só para as próximas vendas: vendas já feitas guardam o custo da época e o lucro delas não muda. Se o estoque estiver zerado, o custo passa a ser o da compra nova. O frete é dividido entre os produtos.</p>
     <div class="sum" id="bsum"></div><div class="warn-t" id="wwarn"></div>
     <div class="err-t" id="err" role="alert"></div>
     <button class="btn" data-act="save-buy">Registrar compra</button>
@@ -937,8 +939,8 @@ async function saveBuy(btn) {
     const done = {};
     for (let i = 0; i < F.lines.length; i++) { const l = F.lines[i], k = c.lines[i], key = k.key, r = c.run[key], when = F.date;
       let pid = l.pid;
-      if (pid === NEWP) { pid = uid('p'); await db.collection('products').doc(pid).set({n: Date.now() + i, name: l.name.trim(), brand: l.brand.trim(), cost: r2(r.cost), price: r2(num(l.price)), stock: r.st, initial: r.init}); }
-      else if (!done[key]) { await db.doc('products/' + pid).update({stock: r.st, initial: r.init, cost: r2(r.cost)}); done[key] = 1; }
+      if (pid === NEWP) { pid = uid('p'); await db.collection('products').doc(pid).set({n: Date.now() + i, name: l.name.trim(), brand: l.brand.trim(), cost: r2(r.cost), price: r2(num(l.price)), stock: r.st, initial: r.init, spent: r2(r.spent)}); }
+      else if (!done[key]) { await db.doc('products/' + pid).update({stock: r.st, initial: r.init, cost: r2(r.cost), spent: r2(r.spent)}); done[key] = 1; }
       const name = l.pid === NEWP ? l.name.trim() : (S.products.find(x => x.id === l.pid) || {}).name;
       await db.collection('wallet').doc(uid('w')).set({type: 'saida', kind: 'compra', amount: r2(k.amount), date: when, note: `Compra: ${k.q}× ${name}`, pid, qty: k.q});
     }
